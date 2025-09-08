@@ -1,0 +1,1130 @@
+// DocumentBridge.tsx
+import React, {
+    createContext,
+    useContext,
+    useMemo,
+    useCallback,
+    useState,
+    useEffect,
+    useRef,
+} from "react"
+import { NormalizedItem, DocumentVersion } from "./NormalizedItem.ts"
+import EventBus from "./EventBus.ts"
+import { createClient } from "@supabase/supabase-js"
+import { useResumeDataContext } from "./ResumeDataContext.tsx"
+import { ViRADocumentEditor } from "./ViRADocumentEditor.ts"
+
+// ---- Supabase client ----
+const supabaseUrl = "https://keyjjxsqwflifeloekej.supabase.co"
+const supabaseKey =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtleWpqeHNxd2ZsaWZlbG9la2VqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTA5NzY1NjUsImV4cCI6MjA2NjU1MjU2NX0.t-XwAsW9NJxungDU1vTP2dPNqzjSOjz8t-xmiItqDfo"
+const supabase = createClient(supabaseUrl, supabaseKey)
+
+// ---- helpers ----
+const generateId = () =>
+    "xxxx-xxxx-4xxx-yxxx-xxxx".replace(/[xy]/g, (c) => {
+        const r = (Math.random() * 16) | 0
+        const v = c === "x" ? r : (r & 0x3) | 0x8
+        return v.toString(16)
+    })
+
+const getCurrentSessionId = () => "default_session"
+
+const deduplicateItems = (items: NormalizedItem[]): NormalizedItem[] => {
+    const seen = new Set<string>()
+    return items.filter((item) => {
+        const key = `${item.section}|${item.index}|${item.filename}|${item.type}|${(item.text || "").slice(0, 50)}`
+        if (seen.has(key)) {
+            return false
+        }
+        seen.add(key)
+        return true
+    })
+}
+
+// ---- context types ----
+interface DocumentBridgeContext {
+    getDocumentText: (filename: string) => string
+    getDocumentJSON: (filename: string) => NormalizedItem[]
+    getActiveDocuments: () => string[]
+    applyEdit: (
+        filename: string,
+        section: string,
+        index: number,
+        operation: string,
+        newText: string,
+        isHeader?: boolean,
+        jobIdx?: number
+    ) => Promise<void>
+    addDocument: (filename: string, items: NormalizedItem[]) => Promise<void>
+    removeDocument: (filename: string) => Promise<void>
+    updateDocument: (filename: string, items: NormalizedItem[]) => Promise<void>
+    getVersionInfo: (filename: string) => DocumentVersion | null
+    undo: (filename: string) => Promise<void>
+    redo: (filename: string) => Promise<void>
+    setFileContents: (contents: {
+        [filename: string]: NormalizedItem[]
+    }) => void
+    setDocumentJSON: (
+        filename: string,
+        items: NormalizedItem[]
+    ) => Promise<void>
+    getNextSection: (currentSection: string) => string | null
+    manualSave: (
+        filename: string,
+        triggerDownload?: boolean
+    ) => Promise<boolean>
+    findInDocuments: (
+        query: string
+    ) => Array<{ filename: string; section: string; text: string }>
+    loadVersion: (filename: string, uiVersion: number) => Promise<boolean>
+}
+
+const Context = createContext<DocumentBridgeContext>({
+    getDocumentText: () => "",
+    getDocumentJSON: () => [],
+    getActiveDocuments: () => [],
+    applyEdit: async () => {},
+    findInDocuments: () => [],
+    addDocument: async () => {},
+    removeDocument: async () => {},
+    updateDocument: async () => {},
+    getVersionInfo: () => null,
+    undo: async () => {},
+    redo: async () => {},
+    setDocumentJSON: async () => {},
+    getNextSection: () => null,
+    manualSave: async () => false,
+    setFileContents: () => {},
+    loadVersion: async () => false,
+})
+
+// ---- provider ----
+interface DocumentBridgeProviderProps {
+    children: React.ReactNode
+    fileContents?: { [filename: string]: NormalizedItem[] }
+    setFileContents?: (contents: {
+        [filename: string]: NormalizedItem[]
+    }) => void
+}
+
+export const DocumentBridgeProvider: React.FC<DocumentBridgeProviderProps> = ({
+    children,
+    fileContents: externalFileContents,
+    setFileContents: externalSetFileContents,
+}) => {
+    // optional resume context (safe)
+    let parsedResume: any = null
+    let setParsedResume: any = null
+    try {
+        const resumeContext = useResumeDataContext()
+        parsedResume = resumeContext?.parsedResume
+        setParsedResume = resumeContext?.setParsedResume
+    } catch (err) {
+        parsedResume = null
+        setParsedResume = null
+    }
+
+    const [internalFileContents, setInternalFileContents] = useState<{
+        [filename: string]: NormalizedItem[]
+    }>(externalFileContents || {})
+
+    // Version history: 1-based
+    const [versionHistory, setVersionHistory] = useState<{
+        [filename: string]: DocumentVersion
+    }>({})
+
+    const previousFiles = useRef<Set<string>>(new Set())
+
+    const fileContents = externalFileContents || internalFileContents
+    const setFileContents = externalSetFileContents || setInternalFileContents
+
+    // ---- exit cleanup (best-effort) ----
+    useEffect(() => {
+        const cleanup = () => {
+            supabase
+                .from("documents")
+                .delete()
+                .eq("session_id", getCurrentSessionId())
+                .then(() => {
+                    console.log(
+                        "[DocumentBridge] Supabase session cleanup complete"
+                    )
+                })
+                .catch((err) => {
+                    console.warn(
+                        "[DocumentBridge] Supabase cleanup failed:",
+                        err
+                    )
+                })
+        }
+        window.addEventListener("beforeunload", cleanup)
+        return () => {
+            window.removeEventListener("beforeunload", cleanup)
+            // try best-effort on unmount
+            try {
+                cleanup()
+            } catch (err) {
+                console.warn("Cleanup error:", err)
+            }
+        }
+    }, [])
+
+    // ---- detectNewUploads -> Reliable autosave with immediate UI feedback ----
+    const processedFiles = new Set<string>()
+
+    useEffect(() => {
+        const detectNewUploads = async () => {
+            console.log("[DocumentBridge] detectNewUploads running")
+            console.log(
+                "[DocumentBridge] Current files:",
+                Object.keys(fileContents)
+            )
+            console.log(
+                "[DocumentBridge] Previous files:",
+                Array.from(previousFiles.current)
+            )
+
+            try {
+                const currentFiles = new Set(Object.keys(fileContents))
+                const newFiles = Array.from(currentFiles).filter(
+                    (fn) => !previousFiles.current.has(fn)
+                )
+
+                console.log("[DocumentBridge] New files detected:", newFiles)
+
+                if (newFiles.length === 0) {
+                    console.log("[DocumentBridge] No new files to process")
+                    previousFiles.current = currentFiles
+                    return
+                }
+
+                for (const filename of newFiles) {
+                    const items = fileContents[filename] || []
+                    console.log(
+                        `[DocumentBridge] Processing ${filename}, items:`,
+                        items.length
+                    )
+
+                    if (items.length === 0) {
+                        console.log(
+                            `[DocumentBridge] Skipping empty file: ${filename}`
+                        )
+                        continue
+                    }
+
+                    // Step 1: Normalize the data
+                    const normalized = items
+                        .map((it, idx) => {
+                            // Skip if it looks like default metadata and we have real content elsewhere
+                            if (
+                                it.text === "Default Section" &&
+                                parsedResume?.parsedItems?.length > 1
+                            ) {
+                                console.warn(
+                                    `[DocumentBridge] Skipping default metadata for ${filename}, using real content`
+                                )
+                                return null // Or replace with real item from parsedResume
+                            }
+                            if (
+                                it.type === "header" ||
+                                it.type === "paragraph"
+                            ) {
+                                return {
+                                    type: it.type,
+                                    text: it.text || "Untitled",
+                                    section: it.section || "",
+                                    index: it.index || idx,
+                                    filename: filename,
+                                }
+                            }
+                            // Otherwise treat as raw content
+                            return {
+                                type: "paragraph",
+                                text:
+                                    typeof it === "string"
+                                        ? it
+                                        : it.text || "Untitled",
+                                section: "",
+                                index: idx,
+                                filename: filename,
+                            }
+                        })
+                        .filter(Boolean)
+                    // Step 2: Update fileContents with normalized data
+                    setFileContents((prev) => ({
+                        ...prev,
+                        [filename]: normalized,
+                    }))
+
+                    // Step 3: Create Version 1 in local state immediately
+                    setVersionHistory((prev) => ({
+                        ...prev,
+                        [filename]: {
+                            original: normalized.map((it) => ({ ...it })),
+                            current: normalized.map((it) => ({ ...it })),
+                            history: [],
+                            lastUpdated: new Date(),
+                            currentVersion: 1,
+                            maxVersion: 1,
+                        },
+                    }))
+
+                    console.log(
+                        `[DocumentBridge] Created local Version 1 for ${filename}`
+                    )
+
+                    // Step 4: Save Version 1 to Supabase and emit events ONLY on success
+                    const { data: existingV1, error: checkError } =
+                        await supabase
+                            .from("documents")
+                            .select("version")
+                            .eq("session_id", getCurrentSessionId())
+                            .eq("filename", filename)
+                            .eq("version", 1)
+                            .limit(1)
+
+                    if (existingV1 && existingV1.length > 0) {
+                        console.log(
+                            `[DocumentBridge] Version 1 already exists for ${filename}, skipping autosave`
+                        )
+                        continue // Skip to next file
+                    }
+
+                    // Additional check: Has this file been processed in the current upload batch?
+                    if (processedFiles.has(filename)) {
+                        console.log(
+                            `[DocumentBridge] File ${filename} already processed in this batch, skipping`
+                        )
+                        continue
+                    }
+
+                    // Mark this file as processed before saving
+                    processedFiles.add(filename)
+
+                    // Only save Version 1 if it doesn't exist
+                    try {
+                        const { data, error } = await supabase
+                            .from("documents")
+                            .upsert(
+                                {
+                                    session_id: getCurrentSessionId(),
+                                    filename,
+                                    version: 1,
+                                    items: normalized,
+                                    created_at: new Date().toISOString(),
+                                    updated_at: new Date().toISOString(),
+                                },
+                                {
+                                    onConflict: [
+                                        "session_id",
+                                        "filename",
+                                        "version",
+                                    ],
+                                }
+                            )
+
+                        if (error) {
+                            console.error(
+                                `[DocumentBridge] Failed to save Version 1 for ${filename}:`,
+                                error
+                            )
+                            // Emit events anyway to show local version exists
+                            EventBus.emit("VersionUpdated", {
+                                filename,
+                                version: 1,
+                            })
+                            EventBus.emit("ShowBanner", {
+                                message: `Version 1 saved (local only)`,
+                                type: "warning",
+                            })
+                        } else {
+                            console.log(
+                                `[DocumentBridge] SUCCESS: Version 1 saved to Supabase for ${filename}`
+                            )
+                            // Emit success events
+                            EventBus.emit("VersionUpdated", {
+                                filename,
+                                version: 1,
+                            })
+                            EventBus.emit("ShowBanner", {
+                                message: `Original version auto-saved as Version 1`,
+                                type: "success",
+                            })
+                        }
+                    } catch (saveError) {
+                        console.error(
+                            `[DocumentBridge] Supabase save error for ${filename}:`,
+                            saveError
+                        )
+                        // Still emit events to show version exists locally
+                        EventBus.emit("VersionUpdated", {
+                            filename,
+                            version: 1,
+                        })
+                        EventBus.emit("ShowBanner", {
+                            message: `Version 1 saved (local only)`,
+                            type: "warning",
+                        })
+                    }
+                }
+
+                // Update previousFiles to include the new files
+                previousFiles.current = currentFiles
+                console.log(
+                    "[DocumentBridge] Updated previousFiles:",
+                    Array.from(previousFiles.current)
+                )
+            } catch (err) {
+                console.error("[DocumentBridge] detectNewUploads error:", err)
+            }
+        }
+
+        detectNewUploads()
+    }, [fileContents, setFileContents, setVersionHistory])
+
+    // ---- utilities ----
+    const getDocumentText = useCallback(
+        (filename: string) => {
+            if (!fileContents[filename]) return ""
+            return fileContents[filename]
+                .map((it) => it.text || "Untitled")
+                .join("\n\n")
+        },
+        [fileContents]
+    )
+
+    const getDocumentJSON = useCallback(
+        (filename: string) => {
+            const items = fileContents[filename] || []
+            return items.map((it) => ({ ...it, text: it.text || "Untitled" }))
+        },
+        [fileContents]
+    )
+
+    const getActiveDocuments = useCallback(
+        () => Object.keys(fileContents),
+        [fileContents]
+    )
+
+    // ---- applyEdit ----
+    const applyEdit = useCallback(
+        async (
+            filename: string,
+            section: string,
+            index: number,
+            operation: string,
+            newText: string,
+            isHeader: boolean = false,
+            jobIdx?: number
+        ) => {
+            setFileContents((prev) => {
+                const curr = prev[filename] || []
+                const updated = [...curr]
+                const idx = updated.findIndex(
+                    (it) =>
+                        it.section === section &&
+                        it.index === index &&
+                        it.filename === filename
+                )
+                if (idx !== -1) {
+                    updated[idx] = {
+                        ...updated[idx],
+                        text: newText || "Untitled",
+                    }
+                    if (isHeader) {
+                        updated[idx].type = "header"
+                    }
+                } else {
+                    // do nothing
+                }
+
+                if (setParsedResume) {
+                    setParsedResume((prevResume: any) => {
+                        if (!prevResume) return prevResume
+                        const parsed = prevResume.parsedItems || []
+                        const updatedParsed = parsed.map((p: any) =>
+                            p.section === section &&
+                            p.index === index &&
+                            p.filename === filename
+                                ? { ...p, text: newText || "Untitled" }
+                                : p
+                        )
+                        return {
+                            ...prevResume,
+                            parsedItems: updatedParsed,
+                            _forceUpdate: Date.now(),
+                        }
+                    })
+                }
+
+                return { ...prev, [filename]: updated }
+            })
+
+            EventBus.emit("ApplyEdit", {
+                filename,
+                section,
+                index,
+                operation,
+                newText: newText || "Untitled",
+                isHeader,
+                jobIdx,
+            })
+        },
+        [setFileContents, setParsedResume]
+    )
+
+    // ---- add / remove / update document ----
+    const addDocument = useCallback(
+        async (filename: string, items: NormalizedItem[]) => {
+            const normalized = items.map((it) => ({
+                ...it,
+                text: it.text || "Untitled",
+            }))
+            setFileContents((prev) => ({ ...prev, [filename]: normalized }))
+            setVersionHistory((prev) => ({
+                ...prev,
+                [filename]: {
+                    original: normalized.map((it) => ({ ...it })),
+                    current: normalized.map((it) => ({ ...it })),
+                    history: [],
+                    lastUpdated: new Date(),
+                    currentVersion: 1,
+                    maxVersion: 1,
+                },
+            }))
+        },
+        [setFileContents]
+    )
+
+    const removeDocument = useCallback(
+        async (filename: string) => {
+            setFileContents((prev) => {
+                const copy = { ...prev }
+                delete copy[filename]
+                return copy
+            })
+            setVersionHistory((prev) => {
+                const copy = { ...prev }
+                delete copy[filename]
+                return copy
+            })
+        },
+        [setFileContents, setVersionHistory]
+    )
+
+    const updateDocument = useCallback(
+        async (filename: string, items: NormalizedItem[]) => {
+            const normalized = items.map((it) => ({
+                ...it,
+                text: it.text || "Untitled",
+            }))
+            setFileContents((prev) => ({ ...prev, [filename]: normalized }))
+            setVersionHistory((prev) => {
+                if (!prev[filename]) return prev
+                return {
+                    ...prev,
+                    [filename]: {
+                        ...prev[filename],
+                        current: normalized,
+                        lastUpdated: new Date(),
+                    },
+                }
+            })
+        },
+        [setFileContents, setVersionHistory]
+    )
+
+    const findInDocuments = useCallback(
+        (searchTerm: string) => {
+            const results: {
+                filename: string
+                section: string
+                text: string
+            }[] = []
+            const lower = searchTerm.toLowerCase()
+            Object.entries(fileContents).forEach(([filename, items]) => {
+                let currentSection = ""
+                items.forEach((item) => {
+                    if (item.type === "header")
+                        currentSection = item.text || "Untitled"
+                    if (
+                        (item.text || "Untitled").toLowerCase().includes(lower)
+                    ) {
+                        results.push({
+                            filename,
+                            section: currentSection,
+                            text: item.text || "Untitled",
+                        })
+                    }
+                })
+            })
+            return results
+        },
+        [fileContents]
+    )
+
+    const getVersionInfo = useCallback(
+        (filename: string) => versionHistory[filename] || null,
+        [versionHistory]
+    )
+
+    // ---- database helpers ----
+    const getMaxVersionFromDB = useCallback(
+        async (filename: string): Promise<number> => {
+            return supabase
+                .from("documents")
+                .select("version")
+                .eq("session_id", getCurrentSessionId())
+                .eq("filename", filename)
+                .order("version", { ascending: false })
+                .limit(1)
+                .then(({ data, error }) => {
+                    if (error) {
+                        console.warn(
+                            "[DocumentBridge] getMaxVersionFromDB error:",
+                            error
+                        )
+                        return (
+                            versionHistory[filename]?.maxVersion ||
+                            versionHistory[filename]?.currentVersion ||
+                            1
+                        )
+                    }
+                    if (!data || data.length === 0) return 1
+                    return data[0].version || 1
+                })
+                .catch((err) => {
+                    console.warn(
+                        "[DocumentBridge] getMaxVersionFromDB catch:",
+                        err
+                    )
+                    return (
+                        versionHistory[filename]?.maxVersion ||
+                        versionHistory[filename]?.currentVersion ||
+                        1
+                    )
+                })
+        },
+        [versionHistory]
+    )
+
+    const loadVersion = useCallback(
+        async (filename: string, uiVersion: number): Promise<boolean> => {
+            try {
+                const { data, error } = await supabase
+                    .from("documents")
+                    .select("items")
+                    .eq("session_id", getCurrentSessionId())
+                    .eq("filename", filename)
+                    .eq("version", uiVersion)
+                    .limit(1)
+
+                if (error) {
+                    console.error("[DocumentBridge] loadVersion error:", error)
+                    return false
+                }
+
+                if (!data || data.length === 0) {
+                    console.warn(
+                        `[DocumentBridge] No data found for version ${uiVersion} of ${filename}`
+                    )
+                    return false
+                }
+
+                const items = data[0].items || []
+
+                // Set raw items to fileContents for save preservation
+                setFileContents((prev) => ({
+                    ...prev,
+                    [filename]: items,
+                }))
+
+                // Re-index for UI display
+                const reIndexedItems = items.map((it, idx) => ({
+                    ...it,
+                    index: idx,
+                }))
+
+                if (setParsedResume) {
+                    setParsedResume((prev: any) => ({
+                        ...prev,
+                        parsedItems: reIndexedItems.map(
+                            (it: NormalizedItem) => ({
+                                ...it,
+                                filename,
+                            })
+                        ),
+                    }))
+                }
+
+                setVersionHistory((prev) => ({
+                    ...prev,
+                    [filename]: {
+                        ...(prev[filename] || {
+                            original: items.map((it) => ({ ...it })),
+                            current: items.map((it) => ({ ...it })),
+                            history: [],
+                            lastUpdated: new Date(),
+                            currentVersion: 1,
+                            maxVersion: 1,
+                        }),
+                        current: items.map((it) => ({ ...it })),
+                        currentVersion: uiVersion,
+                        lastUpdated: new Date(),
+                    },
+                }))
+
+                EventBus.emit("VersionLoaded", {
+                    filename,
+                    version: uiVersion,
+                })
+                return true
+            } catch (err) {
+                console.error("[DocumentBridge] loadVersion catch:", err)
+                return false
+            }
+        },
+        [setFileContents, setParsedResume, setVersionHistory]
+    )
+
+    // ---- undo / redo ----
+    const undo = useCallback(
+        async (filename: string) => {
+            const info = versionHistory[filename]
+            if (!info) return
+            const target = info.currentVersion - 1
+            if (target < 1) return
+            await loadVersion(filename, target)
+        },
+        [versionHistory, loadVersion]
+    )
+
+    const redo = useCallback(
+        async (filename: string) => {
+            const info = versionHistory[filename]
+            if (!info) return
+            const target = info.currentVersion + 1
+            if (target > (info.maxVersion || info.currentVersion)) return
+            await loadVersion(filename, target)
+        },
+        [versionHistory, loadVersion]
+    )
+
+    // ---- manualSave ----
+    const manualSave = useCallback(
+        async (
+            filename: string,
+            triggerDownload: boolean = false
+        ): Promise<boolean> => {
+            console.error("MANUAL SAVE TRIGGERED FOR:", filename) // Use console.error to make it red and visible
+            alert("Manual save triggered!")
+
+            // DOM DUPLICATION DIAGNOSTIC
+            console.log("=== DOM DUPLICATION DIAGNOSTIC ===")
+            if (typeof document !== "undefined") {
+                const domElements = document.querySelectorAll(
+                    `[data-filename="${filename}"]`
+                )
+                console.log(
+                    `[DEBUG] DOM elements for ${filename}:`,
+                    domElements.length
+                )
+                console.log(
+                    `[DEBUG] fileContents for ${filename}:`,
+                    fileContents[filename]?.length || 0
+                )
+
+                // Log each DOM element's details
+                domElements.forEach((el, idx) => {
+                    console.log(`[DEBUG] DOM Element ${idx}:`, {
+                        section: el.getAttribute("data-section"),
+                        index: el.getAttribute("data-index"),
+                        text: (el.textContent || "").substring(0, 50) + "...",
+                        tagName: el.tagName,
+                    })
+                })
+
+                // Check for duplicate sections/indexes
+                const sectionIndexPairs = Array.from(domElements).map(
+                    (el) =>
+                        `${el.getAttribute("data-section")}:${el.getAttribute("data-index")}`
+                )
+                const duplicates = sectionIndexPairs.filter(
+                    (item, index) => sectionIndexPairs.indexOf(item) !== index
+                )
+                if (duplicates.length > 0) {
+                    console.error(
+                        "[DEBUG] DUPLICATE DOM ELEMENTS FOUND:",
+                        duplicates
+                    )
+                }
+            } else {
+                console.log("[DEBUG] Document not available (SSR)")
+            }
+
+            console.log(`[DEBUG] Local fileContents items:`)
+            fileContents[filename]?.forEach((item, idx) => {
+                console.log(`[DEBUG] Item ${idx}:`, {
+                    section: item.section,
+                    index: item.index,
+                    text: (item.text || "").substring(0, 50) + "...",
+                    type: item.type,
+                })
+            })
+            console.log("=== END DIAGNOSTIC ===")
+
+            try {
+                // CRITICAL: Normalize filename to handle inconsistencies
+                // Remove spaces and special characters that might cause issues
+                const normalizeFilename = (fn: string) => {
+                    // Keep the original filename but log any transformation
+                    console.log(`[DocumentBridge] Original filename: ${fn}`)
+                    return fn
+                }
+
+                const normalizedFilename = normalizeFilename(filename)
+
+                // Step 1: Capture current items (from DOM or fallback)
+                let itemsToSave: NormalizedItem[] = []
+                if (typeof document !== "undefined") {
+                    const domEditableNodes = document.querySelectorAll(
+                        `[data-filename="${filename}"]`
+                    )
+                    if (domEditableNodes.length > 0) {
+                        itemsToSave = Array.from(domEditableNodes).map(
+                            (el) => ({
+                                type: el.tagName.startsWith("H")
+                                    ? "header"
+                                    : "paragraph",
+                                text: el.textContent || "",
+                                section: el.getAttribute("data-section") || "",
+                                index: parseInt(
+                                    el.getAttribute("data-index") || "0"
+                                ),
+                                filename: normalizedFilename,
+                            })
+                        )
+                    }
+                }
+                if (itemsToSave.length === 0) {
+                    const structured = getDocumentJSON(filename)
+                    itemsToSave =
+                        structured.length > 0
+                            ? structured
+                            : fileContents[filename] || []
+                }
+                if (!itemsToSave || itemsToSave.length === 0) {
+                    console.error(
+                        `[DocumentBridge] No items to save for ${filename}`
+                    )
+                    return false
+                }
+                let normalizedSave = itemsToSave.map((it) => ({
+                    ...it,
+                    text: it.text || "Untitled",
+                    filename: normalizedFilename, // Ensure consistent filename
+                }))
+                normalizedSave = deduplicateItems(normalizedSave)
+
+                // Step 2: Check ALL possible filename variations in the database
+                let maxVersion = 0
+                let latestItems: NormalizedItem[] = []
+                let actualFilenameInDB = normalizedFilename
+
+                // Check for versions with different filename variations
+                const possibleFilenames = [normalizedFilename]
+
+                console.log(
+                    "[DocumentBridge] Checking for versions with filenames:",
+                    possibleFilenames
+                )
+
+                // Check each possible filename
+                for (const checkFilename of possibleFilenames) {
+                    const { data: versions, error } = await supabase
+                        .from("documents")
+                        .select("version, filename")
+                        .eq("session_id", getCurrentSessionId())
+                        .eq("filename", checkFilename)
+                        .order("version", { ascending: false })
+
+                    if (!error && versions && versions.length > 0) {
+                        const checkMax = Math.max(
+                            ...versions.map((v) => v.version || 1)
+                        )
+                        if (checkMax > maxVersion) {
+                            maxVersion = checkMax
+                            actualFilenameInDB = checkFilename
+                            console.log(
+                                `[DocumentBridge] Found ${versions.length} versions for filename "${checkFilename}", max is ${maxVersion}`
+                            )
+                        }
+                    }
+                }
+
+                // If we found versions, get the latest items for comparison
+                if (maxVersion > 0) {
+                    const { data, error } = await supabase
+                        .from("documents")
+                        .select("items")
+                        .eq("session_id", getCurrentSessionId())
+                        .eq("filename", actualFilenameInDB)
+                        .eq("version", maxVersion)
+                        .limit(1)
+
+                    if (!error && data && data.length > 0) {
+                        latestItems = data[0].items || []
+                    }
+                } else {
+                    // No versions found in database
+                    console.log(
+                        "[DocumentBridge] No versions found in database for any filename variation"
+                    )
+
+                    // Check local state
+                    const localVersion =
+                        versionHistory[filename]?.currentVersion || 0
+                    if (localVersion > 0) {
+                        maxVersion = localVersion
+                        console.log(
+                            `[DocumentBridge] Using local version ${maxVersion} as max`
+                        )
+                    } else if (
+                        fileContents[filename] &&
+                        fileContents[filename].length > 0
+                    ) {
+                        // We have content but no versions - assume version 1 exists
+                        maxVersion = 1
+                        actualFilenameInDB = normalizedFilename
+                        console.log(
+                            "[DocumentBridge] File has content, assuming version 1 exists"
+                        )
+                    }
+                }
+
+                // Step 3: Compare with latest version if it exists
+                if (maxVersion > 0 && latestItems.length > 0) {
+                    const sortItems = (items: NormalizedItem[]) =>
+                        items.slice().sort((a, b) => a.index - b.index)
+                    const latestJson = JSON.stringify(
+                        sortItems(
+                            latestItems.map((it) => ({
+                                ...it,
+                                text: it.text || "Untitled",
+                            }))
+                        )
+                    )
+                    const newJson = JSON.stringify(sortItems(normalizedSave))
+                    if (latestJson === newJson) {
+                        EventBus.emit("ShowBanner", {
+                            message: "No changes to save",
+                            type: "info",
+                        })
+                        return true // No new version needed
+                    }
+                }
+
+                // Step 4: Calculate next version - NEVER overwrite version 1
+                let nextVersion = maxVersion + 1
+
+                // Extra safety: Never save as version 1 if we have content
+                if (
+                    nextVersion === 1 &&
+                    (maxVersion > 0 ||
+                        (fileContents[filename] &&
+                            fileContents[filename].length > 0))
+                ) {
+                    console.warn(
+                        "[DocumentBridge] Preventing version 1 overwrite, saving as version 2"
+                    )
+                    nextVersion = 2
+                }
+
+                console.log(
+                    `[DocumentBridge] Saving as version ${nextVersion} (max was ${maxVersion}) with filename "${actualFilenameInDB}"`
+                )
+
+                // Step 5: Update local fileContents immediately
+                setFileContents((prev) => ({
+                    ...prev,
+                    [filename]: normalizedSave,
+                }))
+
+                // Step 6: Upsert to Supabase - use the actual filename from DB if found
+                const { error } = await supabase.from("documents").upsert(
+                    {
+                        session_id: getCurrentSessionId(),
+                        filename: actualFilenameInDB, // Use the filename that exists in DB
+                        version: nextVersion,
+                        items: normalizedSave,
+                        created_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString(),
+                    },
+                    { onConflict: ["session_id", "filename", "version"] }
+                )
+                if (error) {
+                    console.error(
+                        `[DocumentBridge] Failed to save Version ${nextVersion}:`,
+                        error
+                    )
+                    EventBus.emit("ShowBanner", {
+                        message: `Failed to save Version ${nextVersion}`,
+                        type: "error",
+                    })
+                    return false
+                }
+
+                // Step 7: Update local versionHistory atomically
+                setVersionHistory((prev) => {
+                    const prevInfo = prev[filename] || {
+                        original: normalizedSave.map((it) => ({ ...it })),
+                        current: normalizedSave.map((it) => ({ ...it })),
+                        history: [],
+                        lastUpdated: new Date(),
+                        currentVersion: 1,
+                        maxVersion: 1,
+                    }
+
+                    const fullHistory = prevInfo.history || []
+
+                    const updatedHistory = [
+                        ...fullHistory, // <- Use fullHistory instead
+                        normalizedSave.map((it) => ({ ...it })),
+                    ]
+
+                    return {
+                        ...prev,
+                        [filename]: {
+                            ...prevInfo,
+                            current: normalizedSave.map((it) => ({ ...it })),
+                            history: updatedHistory,
+                            lastUpdated: new Date(),
+                            currentVersion: nextVersion,
+                            maxVersion: Math.max(
+                                nextVersion,
+                                prevInfo.maxVersion || 1
+                            ),
+                        },
+                    }
+                })
+
+                // Step 8: Emit success events
+                EventBus.emit("VersionUpdated", {
+                    filename,
+                    version: nextVersion,
+                })
+                EventBus.emit("ShowBanner", {
+                    message: `Version ${nextVersion} saved`,
+                    type: "success",
+                })
+
+                if (triggerDownload) {
+                    // Add download logic if needed
+                }
+
+                return true
+            } catch (err) {
+                console.error("[DocumentBridge] manualSave catch:", err)
+                EventBus.emit("ShowBanner", {
+                    message: "Failed to save changes",
+                    type: "error",
+                })
+                return false
+            }
+        },
+        [
+            fileContents,
+            setFileContents,
+            setVersionHistory,
+            getDocumentJSON,
+            versionHistory,
+        ]
+    )
+
+    // ---- setDocumentJSON & next section ----
+    const setDocumentJSON = useCallback(
+        async (filename: string, items: NormalizedItem[]) => {
+            await updateDocument(filename, items)
+        },
+        [updateDocument]
+    )
+
+    const getNextSection = useCallback(
+        (currentSection: string): string | null => {
+            try {
+                const editor = ViRADocumentEditor.getInstance()
+                const elementOrder = (editor as any).elementOrder
+                const elements = (editor as any).elements as Map<
+                    string,
+                    HTMLElement
+                >
+
+                const currentIndex = elementOrder.findIndex((id: string) => {
+                    const element = elements.get(id)
+                    return (
+                        element?.getAttribute("data-section")?.toLowerCase() ===
+                        currentSection.toLowerCase()
+                    )
+                })
+
+                if (
+                    currentIndex === -1 ||
+                    currentIndex >= elementOrder.length - 1
+                )
+                    return null
+                const nextId = elementOrder[currentIndex + 1]
+                const nextElement = elements.get(nextId)
+                return nextElement?.getAttribute("data-section") || null
+            } catch (err) {
+                console.warn("[DocumentBridge] getNextSection failed:", err)
+                return null
+            }
+        },
+        []
+    )
+
+    // ---- export context ----
+    const contextValue = useMemo(
+        () => ({
+            getDocumentText,
+            getDocumentJSON,
+            getActiveDocuments,
+            applyEdit,
+            findInDocuments,
+            addDocument,
+            removeDocument,
+            updateDocument,
+            getVersionInfo,
+            undo,
+            redo,
+            setDocumentJSON,
+            getNextSection,
+            manualSave,
+            setFileContents,
+            loadVersion,
+        }),
+        [
+            getDocumentText,
+            getDocumentJSON,
+            getActiveDocuments,
+            applyEdit,
+            findInDocuments,
+            addDocument,
+            removeDocument,
+            updateDocument,
+            getVersionInfo,
+            undo,
+            redo,
+            setDocumentJSON,
+            getNextSection,
+            manualSave,
+            setFileContents,
+            loadVersion,
+        ]
+    )
+
+    return <Context.Provider value={contextValue}>{children}</Context.Provider>
+}
+
+export const useDocumentBridge = () => useContext(Context)

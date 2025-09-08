@@ -1,0 +1,180 @@
+import React, { useEffect } from "react"
+import { useDocumentBridge } from "./DocumentBridge.tsx"
+import { useResumeDataContext } from "./ResumeDataContext.tsx"
+
+interface ResumeUploadProps {
+    file: { name: string; originalName: string } | null
+    setParsedResume: React.Dispatch<React.SetStateAction<any>>
+    setError: React.Dispatch<React.SetStateAction<string | null>>
+    editingMode: "user" | "bot"
+}
+
+const isViewOnlyMode = (editingMode: "user" | "bot") => {
+    if (typeof window === "undefined") return false
+    const isPreview = window.location.href.includes("framer.com/preview")
+    const isPublish =
+        window.location.href.includes("framer.com/publish") ||
+        window.__framer_view_only_mode === true
+    return (
+        (isPublish && editingMode !== "bot") ||
+        (isPreview && editingMode !== "bot")
+    )
+}
+
+const ResumeUpload = ({
+    file,
+    setParsedResume,
+    setError,
+    editingMode,
+}: ResumeUploadProps) => {
+    const { getDocumentJSON, updateDocument } = useDocumentBridge() || {
+        getDocumentJSON: () => [],
+        updateDocument: () => {},
+    }
+    // Fallback context to handle missing ResumeDataProvider
+    let parsedResume
+    try {
+        const context = useResumeDataContext()
+        parsedResume = context.parsedResume
+    } catch (error) {
+        console.warn(
+            "[ResumeUpload] ResumeDataProvider not found, using fallback context"
+        )
+        parsedResume = { parsedItems: [], rawText: "", normalizedText: "" }
+    }
+
+    useEffect(() => {
+        try {
+            console.log(
+                "[ResumeUpload] useEffect triggered at",
+                new Date().toISOString(),
+                "with file:",
+                file
+            )
+            if (isViewOnlyMode(editingMode)) {
+                console.warn(
+                    "[ResumeUpload] Skipping upload in view-only mode at",
+                    new Date().toISOString()
+                )
+                return
+            }
+            if (!file?.name || !setParsedResume) {
+                console.error(
+                    "[ResumeUpload] Missing file or setParsedResume at",
+                    new Date().toISOString(),
+                    { file }
+                )
+                setError("No valid resume data")
+                return
+            }
+
+            // Improved needsInitialization: Only trigger if parsedItems is truly empty or mismatched
+            const hasContent =
+                parsedResume?.parsedItems && parsedResume.parsedItems.length > 0
+            const hasMatchingFilename =
+                hasContent &&
+                parsedResume.parsedItems.some(
+                    (item: any) =>
+                        item.filename === file.name ||
+                        item.filename === file.originalName
+                )
+            const needsInitialization = !hasContent || !hasMatchingFilename
+
+            if (needsInitialization) {
+                const parseAndUpdateResume = async () => {
+                    try {
+                        console.log(
+                            "[ResumeUpload] Starting parseAndUpdateResume at",
+                            new Date().toISOString(),
+                            "for:",
+                            file.name
+                        )
+                        // Attempt to get from bridge, but prioritize existing parsedResume if available
+                        let documentContent = await getDocumentJSON(file.name)
+                        console.log(
+                            "[ResumeUpload] getDocumentJSON result at",
+                            new Date().toISOString(),
+                            ":",
+                            documentContent
+                        )
+                        // If bridge is empty but parsedResume has content (from external parser), use that instead of fallback
+                        if (
+                            (!Array.isArray(documentContent) ||
+                                documentContent.length === 0) &&
+                            hasContent
+                        ) {
+                            console.log(
+                                "[ResumeUpload] Bridge empty, but using existing parsedResume content at",
+                                new Date().toISOString()
+                            )
+                            documentContent = parsedResume.parsedItems // Use real content from context
+                        } else if (
+                            !Array.isArray(documentContent) ||
+                            documentContent.length === 0
+                        ) {
+                            // Only fallback if absolutely no content (rare case)
+                            console.warn(
+                                "[ResumeUpload] Empty document and no parsed content at",
+                                new Date().toISOString(),
+                                "using minimal fallback"
+                            )
+                            documentContent = [] // Or handle error: setError("No resume content available");
+                            return
+                        }
+                        // Always enrich with filename to prevent future mismatches
+                        const itemsWithFilename = documentContent.map(
+                            (item: any) => ({
+                                ...item,
+                                filename: file.name,
+                            })
+                        )
+                        // Update bridge with enriched content
+                        updateDocument(file.name, itemsWithFilename)
+                        // Update context with enriched content
+                        setParsedResume((prev: any) => ({
+                            ...prev,
+                            parsedItems: itemsWithFilename,
+                            rawText: prev?.rawText || "",
+                            normalizedText: prev?.normalizedText || "",
+                        }))
+                        console.log(
+                            "[ResumeUpload] Updated with enriched content at",
+                            new Date().toISOString(),
+                            ":",
+                            itemsWithFilename
+                        )
+                    } catch (e: any) {
+                        console.error(
+                            "[ResumeUpload] Error in parseAndUpdateResume at",
+                            new Date().toISOString(),
+                            ":",
+                            e
+                        )
+                        setError(`Failed to load resume: ${e.message}`)
+                    }
+                }
+                parseAndUpdateResume()
+            }
+        } catch (error) {
+            console.error(
+                "[ResumeUpload] Critical error in useEffect at",
+                new Date().toISOString(),
+                ":",
+                error
+            )
+            setError("Critical error during upload initialization")
+        }
+    }, [
+        file,
+        getDocumentJSON,
+        updateDocument,
+        setParsedResume,
+        setError,
+        parsedResume,
+        editingMode,
+    ])
+
+    return null
+}
+
+export default ResumeUpload

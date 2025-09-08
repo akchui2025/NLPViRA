@@ -1,0 +1,1291 @@
+import React, { useState, useEffect, useCallback, useRef } from "react"
+import { motion } from "framer-motion"
+import { NormalizedItem } from "./NormalizedItem.ts"
+import EventBus from "./EventBus.ts"
+import ViraCursorEngine from "./ViraCursorEngine.ts"
+import { ViRAFramerBridgeIntegration } from "./ViRAFramerBridgeIntegration.ts"
+import CanvasElement from "./CanvasElement.tsx"
+import { useResumeDataContext } from "./ResumeDataContext.tsx"
+import { ViRADocumentEditor } from "./ViRADocumentEditor.ts"
+import { RESUME_HEADERS_LIST } from "./normalizeForATS.ts"
+import { useDocumentBridge } from "./DocumentBridge.tsx"
+import debounce from "lodash/debounce"
+
+interface UIAction {
+    type: string
+    targetId: string
+    newValue?: string
+    targetParentId?: string
+    newContent?: { type: string; text: string; [key: string]: any }
+    position?: string | number
+    newOrderIds?: string[]
+    animationType?: string
+    highlightDurationMs?: number
+}
+
+interface PatchOperation {
+    section: string
+    index: number
+    value: string
+}
+
+interface JobSection {
+    title: string
+    bullets: NormalizedItem[]
+}
+
+interface EditOperation {
+    id: string
+    filename: string
+    section: string
+    index: number
+    operation: "replace" | "insert" | "delete"
+    oldValue: string
+    newValue: string
+    timestamp: number
+    source: "user" | "vira"
+    status: "pending" | "persisting" | "persisted" | "failed"
+}
+
+interface ResumeEditProps {
+    file: { name: string; originalName: string } | null
+    deckId: string
+    editingMode: "user" | "bot"
+    fontSizePreset: "S" | "M" | "L"
+    visibleSections: {
+        header: string
+        children: NormalizedItem[]
+        isExperience: boolean
+    }[]
+    isBullet: (text: string) => boolean
+    stripBullet: (text: string) => string
+    isJobTitle: (text: string) => boolean
+    processExperienceSection: (
+        children: Array<NormalizedItem>,
+        globalIndexOffset: number
+    ) => JobSection[]
+    hasUnsavedChanges: boolean
+    setHasUnsavedChanges: React.Dispatch<React.SetStateAction<boolean>>
+    isCanvasActive: boolean
+    canvasState: {
+        elements: {
+            id: string
+            index: number
+            type: string
+            text: string
+            position: { x: number; y: number }
+            style: object
+            filename: string
+            section: string
+        }[]
+        cursor: { elementId: string; position: number } | null
+        hasUnsavedChanges: boolean
+    }
+    setCanvasState: React.Dispatch<React.SetStateAction<any>>
+    applyEdit: (
+        filename: string,
+        section: string,
+        index: number,
+        operation: string,
+        newText: string,
+        isHeader?: boolean,
+        jobIdx?: number
+    ) => Promise<void>
+}
+
+const isViewOnlyMode = (editingMode: "user" | "bot") => {
+    if (typeof window === "undefined") return false
+    const isPreview = window.location.href.includes("framer.com/preview")
+    const isPublish =
+        window.location.href.includes("framer.com/publish") ||
+        window.__framer_view_only_mode === true
+    return (
+        (isPublish && editingMode !== "bot") ||
+        (isPreview && editingMode !== "bot")
+    )
+}
+
+const ResumeEdit: React.FC<ResumeEditProps> = ({
+    file,
+    deckId,
+    editingMode,
+    fontSizePreset,
+    visibleSections,
+    isBullet,
+    stripBullet,
+    isJobTitle,
+    processExperienceSection,
+    hasUnsavedChanges,
+    setHasUnsavedChanges,
+    isCanvasActive,
+    canvasState,
+    setCanvasState,
+    applyEdit,
+}) => {
+    let parsedResume, setParsedResume
+    try {
+        const context = useResumeDataContext()
+        parsedResume = context.parsedResume
+        setParsedResume = context.setParsedResume
+    } catch (error) {
+        console.warn(
+            "[ResumeEdit] ResumeDataProvider not found, using fallback context"
+        )
+        const [fallbackParsedResume, setFallbackParsedResume] = useState({
+            parsedItems: [],
+            rawText: "",
+            normalizedText: "",
+            pendingEdits: [],
+        })
+        parsedResume = fallbackParsedResume
+        setParsedResume = setFallbackParsedResume
+    }
+
+    const { setFileContents, manualSave, getVersionInfo, cleanupSession } =
+        useDocumentBridge()
+    const [elementCache, setElementCache] = useState<Map<string, HTMLElement>>(
+        new Map()
+    )
+    const [editedElements, setEditedElements] = useState<Set<string>>(new Set())
+    const [isDOMReady, setIsDOMReady] = useState(false)
+    const [pendingEdits, setPendingEdits] = useState<PatchOperation[]>([])
+    const [canvasActions, setCanvasActions] = useState<any[]>([])
+    const [hasInitializedCursor, setHasInitializedCursor] = useState(false)
+    const [documentEditor, setDocumentEditor] =
+        useState<ViRADocumentEditor | null>(null)
+    const [bannerMessage, setBannerMessage] = useState<string | null>(null)
+
+    // CENTRALIZED STATE MANAGEMENT
+    const [editQueue, setEditQueue] = useState<EditOperation[]>([])
+    const [isProcessingEdits, setIsProcessingEdits] = useState(false)
+    const processingRef = useRef(false)
+    const pendingOperationsRef = useRef(new Set<string>())
+
+    const fontSizes = {
+        S: { body: "10pt", header: "11pt" },
+        M: { body: "11pt", header: "12pt" },
+        L: { body: "12pt", header: "13pt" },
+    }
+
+    const showBanner = useCallback(
+        (message: string, duration: number = 3000) => {
+            setBannerMessage(message)
+            setTimeout(() => setBannerMessage(null), duration)
+        },
+        []
+    )
+
+    // LOCAL STATE UPDATE - Keep UI responsive
+    const updateLocalState = useCallback(
+        (edit: EditOperation) => {
+            setParsedResume((prev: any) => {
+                const updatedItems = prev.parsedItems.map((item: any) =>
+                    item.section === edit.section &&
+                    item.index === edit.index &&
+                    item.filename === edit.filename
+                        ? { ...item, text: edit.newValue }
+                        : item
+                )
+
+                return {
+                    ...prev,
+                    parsedItems: updatedItems,
+                    pendingEdits: prev.pendingEdits
+                        .filter(
+                            (pendingEdit: any) =>
+                                !(
+                                    pendingEdit.section === edit.section &&
+                                    pendingEdit.index === edit.index
+                                )
+                        )
+                        .concat([
+                            {
+                                section: edit.section,
+                                index: edit.index,
+                                value: edit.newValue,
+                                timestamp: edit.timestamp,
+                            },
+                        ]),
+                    _forceUpdate: Date.now(),
+                }
+            })
+
+            // Update file contents for document bridge
+            setFileContents((prevContents) => {
+                const currentFile = prevContents[edit.filename] || []
+                const updatedFile = currentFile.map((item) =>
+                    item.section === edit.section && item.index === edit.index
+                        ? { ...item, text: edit.newValue }
+                        : item
+                )
+
+                return {
+                    ...prevContents,
+                    [edit.filename]: updatedFile,
+                }
+            })
+        },
+        [setParsedResume, setFileContents]
+    )
+
+    // BACKEND PERSISTENCE - Single reliable pathway
+    const persistEditToBackend = useCallback(
+        async (edit: EditOperation) => {
+            try {
+                // Update status to persisting
+                setEditQueue((prev) =>
+                    prev.map((e) =>
+                        e.id === edit.id ? { ...e, status: "persisting" } : e
+                    )
+                )
+
+                console.log(
+                    `[SavePipeline] Persisting ${edit.source} edit to backend:`,
+                    edit
+                )
+
+                // Use the parent's applyEdit function
+                await applyEdit(
+                    edit.filename,
+                    edit.section,
+                    edit.index,
+                    edit.operation,
+                    edit.newValue
+                )
+
+                // Mark as successfully persisted
+                setEditQueue((prev) =>
+                    prev.map((e) =>
+                        e.id === edit.id ? { ...e, status: "persisted" } : e
+                    )
+                )
+
+                console.log(
+                    `[SavePipeline] Successfully persisted edit:`,
+                    edit.id
+                )
+            } catch (error) {
+                console.error(
+                    `[SavePipeline] Failed to persist edit:`,
+                    edit.id,
+                    error
+                )
+
+                // Mark as failed and attempt rollback
+                setEditQueue((prev) =>
+                    prev.map((e) =>
+                        e.id === edit.id ? { ...e, status: "failed" } : e
+                    )
+                )
+
+                // Rollback UI if backend failed
+                const element = document.querySelector(
+                    `[data-filename="${edit.filename}"][data-section="${edit.section}"][data-index="${edit.index}"]`
+                ) as HTMLElement
+
+                if (element) {
+                    element.textContent = edit.oldValue
+                }
+
+                // Show user feedback
+                showBanner(
+                    `Failed to save ${edit.source} edit. Please try again.`,
+                    5000
+                )
+            }
+        },
+        [applyEdit, showBanner]
+    )
+
+    // UNIFIED EDIT HANDLER - Fixed version with separate user/bot paths
+    const processEdit = useCallback(
+        async (editData: {
+            filename: string
+            section: string
+            index: number
+            operation: "replace" | "insert" | "delete"
+            newValue: string
+            source: "user" | "vira"
+            element?: HTMLElement
+        }) => {
+            const operationId = `${editData.filename}-${editData.section}-${editData.index}-${Date.now()}`
+            // Prevent duplicate operations on same element
+            const elementKey = `${editData.filename}-${editData.section}-${editData.index}`
+            if (pendingOperationsRef.current.has(elementKey)) {
+                console.log(
+                    `[SavePipeline] Skipping duplicate operation on ${elementKey}`
+                )
+                return
+            }
+            // Get current value for rollback capability
+            const element =
+                editData.element ||
+                (document.querySelector(
+                    `[data-filename="${editData.filename}"][data-section="${editData.section}"][data-index="${editData.index}"]`
+                ) as HTMLElement)
+            if (!element) {
+                console.error(
+                    `[SavePipeline] Element not found for bot edit: ${editData.filename}-${editData.section}-${editData.index}`
+                )
+                return
+            }
+            const oldValue = element.textContent || ""
+            const editOperation: EditOperation = {
+                id: operationId,
+                filename: editData.filename,
+                section: editData.section,
+                index: editData.index,
+                operation: editData.operation,
+                oldValue,
+                newValue: editData.newValue,
+                timestamp: Date.now(),
+                source: editData.source,
+                status: "pending",
+            }
+            console.log(
+                `[SavePipeline] Queuing ${editData.source} edit:`,
+                editOperation
+            )
+            // Add to processing queue
+            pendingOperationsRef.current.add(elementKey)
+            setEditQueue((prev) => [...prev, editOperation])
+            // Handle user vs bot edits differently
+            if (editData.source === "user") {
+                // For user edits: DOM is already updated by contentEditable
+                // Just add visual feedback without touching the DOM
+                if (element) {
+                    element.classList.add("temp-moatgreen")
+                    setTimeout(() => {
+                        if (document.body.contains(element)) {
+                            element.classList.remove("temp-moatgreen")
+                        }
+                    }, 3000)
+                }
+            } else {
+                // For bot edits: Update DOM with highlight
+                if (document.body.contains(element)) {
+                    console.log(
+                        `[SavePipeline] Applying bot edit: ${editData.filename}-${editData.section}-${editData.index}, mode: ${editingMode}`
+                    )
+                    element.textContent = editData.newValue
+                    element.classList.add("temp-moatgreen")
+                    setTimeout(() => {
+                        if (document.body.contains(element)) {
+                            element.classList.remove("temp-moatgreen")
+                        }
+                    }, 1500)
+                } else {
+                    console.warn(
+                        `[SavePipeline] Element not in DOM for bot edit: ${editData.filename}-${editData.section}-${editData.index}`
+                    )
+                }
+            }
+            // Update local state immediately for responsiveness
+            updateLocalState(editOperation)
+            // Mark as unsaved
+            setHasUnsavedChanges(true)
+            // Trigger persistence pipeline
+            await persistEditToBackend(editOperation)
+            // Remove from pending operations
+            pendingOperationsRef.current.delete(elementKey)
+        },
+        [
+            file?.name,
+            setParsedResume,
+            setFileContents,
+            setHasUnsavedChanges,
+            updateLocalState,
+            persistEditToBackend,
+        ]
+    )
+
+    // BATCH SAVE OPTIMIZATION - Process multiple edits efficiently
+    const batchSave = useCallback(async () => {
+        const pendingEdits = editQueue.filter(
+            (edit) => edit.status === "pending"
+        )
+
+        if (pendingEdits.length === 0) return
+
+        console.log(`[SavePipeline] Batch saving ${pendingEdits.length} edits`)
+
+        // Process edits in parallel for better performance
+        const savePromises = pendingEdits.map((edit) =>
+            persistEditToBackend(edit)
+        )
+
+        try {
+            await Promise.allSettled(savePromises)
+            console.log(`[SavePipeline] Batch save completed`)
+        } catch (error) {
+            console.error(`[SavePipeline] Batch save error:`, error)
+        }
+    }, [editQueue, persistEditToBackend])
+
+    useEffect(() => {
+        if (!file?.name) {
+            console.warn(
+                "[ResumeEdit] Skipping DOM observer: missing file name"
+            )
+            return
+        }
+        let retries = 3
+        const observer = new MutationObserver(() => {
+            const elements = document.querySelectorAll(
+                `[data-filename="${file.name}"]`
+            )
+            if (elements.length > 0) {
+                console.log("[ResumeEdit] DOM elements found:", elements.length)
+                const newCache = new Map<string, HTMLElement>()
+                elements.forEach((element) => {
+                    const section =
+                        element.getAttribute("data-section") || "unknown"
+                    const index = parseInt(
+                        element.getAttribute("data-index") || "0"
+                    )
+                    element.setAttribute("data-content", element.innerHTML)
+                    newCache.set(`${section}-${index}`, element as HTMLElement)
+                })
+                setElementCache(newCache)
+                setIsDOMReady(true)
+                observer.disconnect()
+            }
+        })
+        observer.observe(document.body, { childList: true, subtree: true })
+        const attemptScan = () => {
+            const elements = document.querySelectorAll(
+                `[data-filename="${file.name}"]`
+            )
+            if (elements.length > 0) {
+                console.log(
+                    "[ResumeEdit] Manual DOM scan found elements:",
+                    elements.length
+                )
+                const newCache = new Map<string, HTMLElement>()
+                elements.forEach((element) => {
+                    const section =
+                        element.getAttribute("data-section") || "unknown"
+                    const index = parseInt(
+                        element.getAttribute("data-index") || "0"
+                    )
+                    element.setAttribute("data-content", element.innerHTML)
+                    newCache.set(`${section}-${index}`, element as HTMLElement)
+                })
+                setElementCache(newCache)
+                setIsDOMReady(true)
+                observer.disconnect()
+            } else if (retries > 0) {
+                retries--
+                console.warn(
+                    "[ResumeEdit] Retrying DOM scan, retries left:",
+                    retries
+                )
+                setTimeout(attemptScan, 5000)
+            } else {
+                console.warn(
+                    "[ResumeEdit] DOM not ready after retries, no elements found"
+                )
+                observer.disconnect()
+            }
+        }
+        const timeout = setTimeout(attemptScan, 15000)
+        return () => {
+            observer.disconnect()
+            clearTimeout(timeout)
+        }
+    }, [file?.name])
+
+    useEffect(() => {
+        if (
+            !file?.name ||
+            !isDOMReady ||
+            visibleSections.length === 0 ||
+            elementCache.size === 0
+        ) {
+            console.log(
+                "[ResumeEdit] Skipping ViRA init due to missing prerequisites",
+                {
+                    file: file?.name,
+                    isDOMReady,
+                    visibleSectionsCount: visibleSections.length,
+                    elementCacheSize: elementCache.size,
+                }
+            )
+            return
+        }
+
+        let cursorCheckInterval: ReturnType<typeof setInterval> | null = null
+
+        const initializeVira = () => {
+            try {
+                const engine = new ViRAFramerBridgeIntegration()
+                console.log(
+                    "[ResumeEdit] ViRAFramerBridgeIntegration initialized"
+                )
+                const cursorEngine = ViraCursorEngine.getInstance()
+                if (editingMode === "bot") {
+                    cursorEngine.init()
+                    console.log(
+                        "[ResumeEdit] ViraCursorEngine initialized in bot mode"
+                    )
+                    const firstElement = Array.from(elementCache.values())[0]
+                    if (firstElement) {
+                        EventBus.emit("ViRACommand", {
+                            target: firstElement.id,
+                            content: "",
+                            method: "highlight_element",
+                        })
+                        setHasInitializedCursor(true)
+                        const ensureCursorVisible = () => {
+                            if (
+                                document.body.getAttribute("data-vira-mode") !==
+                                "bot"
+                            ) {
+                                console.log(
+                                    "[ResumeEdit] No longer in bot mode, stopping cursor checks"
+                                )
+                                if (cursorCheckInterval)
+                                    clearInterval(cursorCheckInterval)
+                                return
+                            }
+                        }
+                        setTimeout(ensureCursorVisible, 1000)
+                        cursorCheckInterval = setInterval(
+                            ensureCursorVisible,
+                            3000
+                        )
+                    } else {
+                        console.warn(
+                            "[ResumeEdit] No valid elements found for cursor initialization"
+                        )
+                        setHasInitializedCursor(false)
+                    }
+                } else {
+                    cursorEngine.disable()
+                    console.log(
+                        "[ResumeEdit] ViraCursorEngine disabled in user mode"
+                    )
+                }
+            } catch (e) {
+                console.error("[ResumeEdit] ViRA initialization failed:", e)
+                setHasInitializedCursor(false)
+            } finally {
+                if (cursorCheckInterval) {
+                    clearInterval(cursorCheckInterval)
+                    cursorCheckInterval = null
+                }
+            }
+        }
+
+        initializeVira()
+
+        return () => {
+            if (cursorCheckInterval) {
+                clearInterval(cursorCheckInterval)
+                cursorCheckInterval = null
+            }
+        }
+    }, [
+        file?.name,
+        isDOMReady,
+        visibleSections.length,
+        elementCache.size,
+        editingMode,
+    ])
+
+    useEffect(() => {
+        if (file?.name && isDOMReady && !documentEditor) {
+            const editor = ViRADocumentEditor.getInstance()
+            const initialized = editor.initialize(file.name)
+            if (initialized) {
+                setDocumentEditor(editor)
+                console.log("[ResumeEdit] Document editor initialized")
+                if (editingMode === "bot") {
+                    document.body.setAttribute("data-vira-mode", "bot")
+                    document.body.classList.add("bot-mode")
+                }
+            }
+        }
+    }, [file?.name, isDOMReady, documentEditor, editingMode])
+
+    useEffect(() => {
+        const handleSaveEvent = (payload: { fileName: string }) => {
+            if (payload.fileName === file?.name) {
+                setHasUnsavedChanges(false)
+                setEditedElements(new Set())
+            }
+        }
+        EventBus.on("SaveEvent", handleSaveEvent)
+        return () => EventBus.off("SaveEvent", handleSaveEvent)
+    }, [file?.name, setHasUnsavedChanges])
+
+    // VIRA COMMAND HANDLER - Unified pathway
+    useEffect(() => {
+        const handleViRACommand = async (command: any) => {
+            if (!file?.name || !isDOMReady) {
+                console.warn("[SavePipeline] Ignoring ViRA command - not ready")
+                return
+            }
+
+            // Skip replace commands in user mode to prevent event interception
+            if (editingMode === "user" && command.method === "replace") return
+
+            console.log(
+                "[SavePipeline] Processing ViRA command via unified pipeline:",
+                command
+            )
+
+            // Handle different ViRA command types
+            if (
+                command.method === "replace" &&
+                command.target &&
+                command.content
+            ) {
+                const { element, section, index } = resolveTargetId(
+                    command.target,
+                    file.name
+                )
+
+                if (element) {
+                    await processEdit({
+                        filename: file.name,
+                        section,
+                        index,
+                        operation: "replace",
+                        newValue: command.content,
+                        source: "vira",
+                        element,
+                    })
+                }
+            }
+
+            // Handle multi-replace operations
+            if (
+                command.method === "multiReplace" &&
+                Array.isArray(command.edits)
+            ) {
+                for (const edit of command.edits) {
+                    const { element, section, index } = resolveTargetId(
+                        edit.target,
+                        file.name
+                    )
+
+                    if (element) {
+                        await processEdit({
+                            filename: file.name,
+                            section,
+                            index,
+                            operation: "replace",
+                            newValue: edit.content,
+                            source: "vira",
+                            element,
+                        })
+                    }
+                }
+            }
+
+            // Handle replace-all operations
+            if (
+                command.method === "replaceAll" &&
+                command.findText &&
+                command.replaceText
+            ) {
+                const elements = document.querySelectorAll(
+                    `[data-filename="${file.name}"]`
+                )
+
+                for (const el of elements) {
+                    const element = el as HTMLElement
+                    const text = element.textContent || ""
+
+                    if (text.includes(command.findText)) {
+                        const section =
+                            element.getAttribute("data-section") || ""
+                        const index = parseInt(
+                            element.getAttribute("data-index") || "0"
+                        )
+                        const newText = text.replace(
+                            new RegExp(command.findText, "g"),
+                            command.replaceText
+                        )
+
+                        await processEdit({
+                            filename: file.name,
+                            section,
+                            index,
+                            operation: "replace",
+                            newValue: newText,
+                            source: "vira",
+                            element,
+                        })
+                    }
+                }
+            }
+        }
+
+        EventBus.on("ViRACommand", handleViRACommand)
+        return () => EventBus.off("ViRACommand", handleViRACommand)
+    }, [file?.name, isDOMReady, processEdit, editingMode])
+
+    // SIMPLIFIED USER INPUT HANDLER - Replace the existing handleInput function
+    const handleInput = useCallback(
+        (event: React.FormEvent<HTMLElement>): void => {
+            // Early exit for non-user modes
+            if (
+                editingMode !== "user" ||
+                isViewOnlyMode(editingMode) ||
+                !file?.name
+            ) {
+                return
+            }
+
+            const target = event.currentTarget
+            const section =
+                target.getAttribute("data-section")?.toLowerCase() || ""
+            const index = parseInt(target.getAttribute("data-index") || "0", 10)
+            const filename = target.getAttribute("data-filename") || file.name
+            const newText = target.textContent || ""
+
+            // DIRECT SAVE - Skip all the complex queue management for user edits
+            const saveUserEdit = async () => {
+                try {
+                    // Update local state immediately
+                    setParsedResume((prev: any) => {
+                        const updatedItems = prev.parsedItems.map(
+                            (item: any) =>
+                                item.section === section &&
+                                item.index === index &&
+                                item.filename === filename
+                                    ? { ...item, text: newText }
+                                    : item
+                        )
+                        return { ...prev, parsedItems: updatedItems }
+                    })
+
+                    // Update file contents
+                    setFileContents((prevContents) => {
+                        const currentFile = prevContents[filename] || []
+                        const updatedFile = currentFile.map((item) =>
+                            item.section === section && item.index === index
+                                ? { ...item, text: newText }
+                                : item
+                        )
+                        return { ...prevContents, [filename]: updatedFile }
+                    })
+
+                    // Mark as changed
+                    setHasUnsavedChanges(true)
+
+                    // Visual feedback
+                    target.classList.add("temp-moatgreen")
+                    setTimeout(() => {
+                        if (document.body.contains(target)) {
+                            target.classList.remove("temp-moatgreen")
+                        }
+                    }, 3000)
+                    // Save to backend after a delay
+                    setTimeout(async () => {
+                        try {
+                            await applyEdit(
+                                filename,
+                                section,
+                                index,
+                                "replace",
+                                newText
+                            )
+                            console.log(
+                                `[SavePipeline] User edit saved: ${section}-${index}`
+                            )
+                        } catch (error) {
+                            console.error(
+                                `[SavePipeline] Failed to save user edit:`,
+                                error
+                            )
+                            // Could add error feedback here
+                        }
+                    }, 1000)
+                } catch (error) {
+                    console.error(
+                        "[SavePipeline] User input processing failed:",
+                        error
+                    )
+                }
+            }
+
+            // Execute the save
+            saveUserEdit()
+        },
+        [
+            editingMode,
+            file?.name,
+            setParsedResume,
+            setFileContents,
+            setHasUnsavedChanges,
+            applyEdit,
+        ]
+    )
+
+    const clearEditedStatus = () => {
+        setEditedElements(new Set())
+        setHasUnsavedChanges(false)
+    }
+
+    const resolveTargetId = (
+        target: string,
+        filename: string
+    ): { element: HTMLElement | null; section: string; index: number } => {
+        let element = document.getElementById(target)
+        let section = ""
+        let index = 0
+
+        if (!element) {
+            console.warn(
+                `[ResumeEdit] Element with ID '${target}' not found for file '${filename}'. Attempting to resolve via cache.`
+            )
+            const cacheKey = target.replace(`item-${filename}-`, "")
+            element = elementCache.get(cacheKey) || null
+        }
+
+        if (!element) {
+            console.error(
+                `[ResumeEdit] Element not found for target: ${target}. Available cache keys:`,
+                Array.from(elementCache.keys())
+            )
+            return { element: null, section: "", index: 0 }
+        }
+
+        const idParts = target.split("-")
+        if (idParts.length >= 3 && idParts.includes("bullet")) {
+            section = `${idParts[1]}-bullet`
+            index = parseInt(idParts[idParts.length - 1], 10) || 0
+        } else if (idParts.length >= 2) {
+            section = idParts[1]
+            const lastPart = idParts[idParts.length - 1]
+            index = parseInt(lastPart, 10) || 0
+        } else {
+            section = idParts[0] || "unknown"
+            index = 0
+        }
+
+        return { element, section, index }
+    }
+
+    const handleManualSave = async () => {
+        if (!file?.name) {
+            console.error("[ResumeEdit] No valid file for manual save")
+            return
+        }
+        try {
+            console.log("[SavePipeline] Manual save initiated")
+
+            // First, process any pending edits
+            await batchSave()
+
+            // Then trigger the document bridge save
+            const success = await manualSave(file.name)
+
+            if (success) {
+                console.log("[SavePipeline] Manual save successful")
+                setHasUnsavedChanges(false)
+                setEditQueue([]) // Clear completed edits
+                showBanner("Resume saved successfully")
+            } else {
+                console.error("[SavePipeline] Manual save failed")
+                showBanner("Failed to save resume", 5000)
+            }
+        } catch (error) {
+            console.error("[SavePipeline] Save error:", error)
+            showBanner("Failed to save resume", 5000)
+        }
+    }
+
+    // AUTO-SAVE MECHANISM - Save periodically
+    useEffect(() => {
+        if (hasUnsavedChanges) {
+            const autoSaveTimer = setTimeout(() => {
+                batchSave()
+            }, 2000) // Auto-save after 2 seconds of inactivity
+
+            return () => clearTimeout(autoSaveTimer)
+        }
+    }, [hasUnsavedChanges, batchSave])
+
+    useEffect(() => {
+        const handleApplyEdit = async (payload: {
+            filename: string
+            section: string
+            index: number
+            operation: string
+            newText: string
+            isHeader?: boolean
+            jobIdx?: number
+        }) => {
+            if (editingMode === "user") {
+                return // Skip bot edits in user mode
+            }
+            if (payload.filename !== file?.name) {
+                return
+            }
+
+            const element = document.querySelector(
+                `[data-filename="${payload.filename}"][data-section="${payload.section}"][data-index="${payload.index}"]`
+            ) as HTMLElement
+
+            if (!element) {
+                console.error(
+                    `[ResumeEdit] Element not found for ${payload.filename}-${payload.section}-${payload.index}`
+                )
+                return
+            }
+
+            await processEdit({
+                filename: payload.filename,
+                section: payload.section,
+                index: payload.index,
+                operation: payload.operation,
+                newValue: payload.newText,
+                source: "vira",
+                element,
+            })
+        }
+
+        EventBus.on("ApplyEdit", handleApplyEdit)
+        return () => EventBus.off("ApplyEdit", handleApplyEdit)
+    }, [
+        file?.name,
+        setParsedResume,
+        setFileContents,
+        setHasUnsavedChanges,
+        editingMode,
+        processEdit,
+    ])
+
+    useEffect(() => {
+        const debouncedSync = debounce(
+            (payload: { filename: string; version: number }) => {
+                if (
+                    payload.filename !== file?.name ||
+                    !isDOMReady ||
+                    !parsedResume?.parsedItems
+                )
+                    return
+                parsedResume.parsedItems.forEach((item: NormalizedItem) => {
+                    const adjustedIndex = item.index // Adjust if offsets applied elsewhere (e.g., processExperienceSection)
+                    const element = document.querySelector(
+                        `[data-filename="${file.name}"][data-section="${item.section}"][data-index="${adjustedIndex}"]`
+                    ) as HTMLElement
+                    if (element && element.textContent !== item.text) {
+                        element.textContent = item.text
+                    }
+                })
+                // Force re-render to ensure DOM reflects state
+                setIsDOMReady(false)
+                setTimeout(() => setIsDOMReady(true), 0)
+            },
+            100
+        )
+
+        EventBus.on("VersionUpdated", debouncedSync)
+        return () => EventBus.off("VersionUpdated", debouncedSync)
+    }, [file?.name, isDOMReady, parsedResume?.parsedItems])
+
+    useEffect(() => {
+        const handleExit = () => {
+            cleanupSession()
+                .then(() =>
+                    console.log("[ResumeEdit] Session cleanup successful")
+                )
+                .catch((err) =>
+                    console.warn("[ResumeEdit] Session cleanup failed:", err)
+                )
+        }
+
+        window.addEventListener("beforeunload", handleExit)
+        return () => {
+            window.removeEventListener("beforeunload", handleExit)
+            handleExit() // Ensure cleanup on unmount
+        }
+    }, [cleanupSession])
+
+    return (
+        <motion.div
+            className="resume-edit-container"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.3 }}
+        >
+            <style jsx>{`
+                .resume-edit-container {
+                    padding: 10px;
+                    width: 100%;
+                    font-family: Satoshi, Arial, sans-serif;
+                    line-height: 1.5;
+                }
+                .resume-edit-container h1 {
+                    font-size: ${fontSizes[fontSizePreset].header};
+                    font-weight: 900;
+                    color: #FFFFFF;
+                    margin: 12px 0 6px;
+                    border-bottom: 2px solid #3a3a3a;
+                    padding-bottom: 5px;
+                    line-height: 1.3;
+                    text-shadow: 0 0 2px #FFFFFF;
+                    caret-color: ${
+                        editingMode === "user" ? "auto" : "transparent"
+                    };
+                }
+                .resume-edit-container .job-title {
+                    font-weight: 900;
+                    font-size: 1.2em;
+                    color: #FFFFFF;
+                    margin: 12px 0 6px;
+                    border-bottom: 2px solid #3a3a3a;
+                    padding-bottom: 5px;
+                    line-height: 1.3;
+                    font-family: Satoshi, Arial, sans-serif;
+                    text-transform: none;
+                    text-shadow: 0 0 2px #FFFFFF;
+                    caret-color: ${
+                        editingMode === "user" ? "auto" : "transparent"
+                    };
+                }
+                .resume-edit-container .bullet-div {
+                    color: #FFFFFF;
+                    padding-left: 1ch;
+                    text-indent: -1ch;
+                    margin-bottom: 4px;
+                    caret-color: ${
+                        editingMode === "user" ? "auto" : "transparent"
+                    };
+                }
+                .resume-edit-container p {
+                    color: #FFFFFF;
+                    margin: 5px 0;
+                    caret-color: ${
+                        editingMode === "user" ? "auto" : "transparent"
+                    };
+                }
+                .resume-edit-container .job-bullets {
+                    margin: 0;
+                    padding: 0;
+                    list-style-position: outside;
+                }
+                .resume-edit-container .job-bullets li {
+                    margin-bottom: 4px;
+                    padding-left: 1ch;
+                    text-indent: -1ch;
+                    list-style-type: disc;
+                    font-weight: 400;
+                    caret-color: ${
+                        editingMode === "user" ? "auto" : "transparent"
+                    };
+                }
+                .resume-edit-container .bullet-item::before {
+                    content: "• ";
+                    color: #FFFFFF;
+                }
+                .resume-edit-container [contentEditable="true"]:not(.job-title):not(h1) {
+                    font-weight: normal !important;
+                }
+                .resume-edit-container.bot-mode [data-filename][contentEditable="true"] .vira-cursor {
+                    display: inline-block !important;
+                    caret-color: #F511BC !important;
+                    opacity: 1 !important;
+                }
+                .resume-edit-container.user-mode [data-filename][contentEditable="true"] .vira-cursor,
+                .resume-edit-container.view-only [data-filename][contentEditable="true"] .vira-cursor {
+                    display: none !important;
+                    caret-color: transparent !important;
+                    opacity: 0 !important;
+                }
+                .resume-edit-container.user-mode [data-filename][contentEditable="true"] {
+                    spellcheck: true;
+                }
+                .resume-edit-container.bot-mode [data-filename][contentEditable],
+                .resume-edit-container.view-only [data-filename][contentEditable] {
+                    spellcheck: false !important;
+                }
+                .resume-edit-container.bot-mode [data-filename][contentEditable] {
+                    pointer-events: none !important;
+                    user-select: text !important;
+                }
+                .resume-edit-container .temp-moatgreen {
+                    color: #00FFC2 !important;
+                }
+                .resume-edit-container .banner-message {
+                    position: fixed;
+                    top: 10px;
+                    left: 50%;
+                    transform: translateX(-50%);
+                    background: #2a2a2a;
+                    color: #FFFFFF;
+                    padding: 10px 20px;
+                    border-radius: 4px;
+                    border: 1px solid #F511BC;
+                    z-index: 1000;
+                    font-size: 12px;
+                    box-shadow: 0 0 10px rgba(245, 17, 188, 0.3);
+                }
+            `}</style>
+            {bannerMessage && (
+                <div className="banner-message">{bannerMessage}</div>
+            )}
+            {isCanvasActive &&
+                canvasState.elements.map((element) => (
+                    <CanvasElement
+                        key={element.id}
+                        element={element}
+                        editingMode={editingMode}
+                        setCanvasState={setCanvasState}
+                    />
+                ))}
+            {visibleSections.map((section, sectionIdx) => {
+                const isExperience = section.isExperience
+                const sectionItems = isExperience
+                    ? processExperienceSection(
+                          section.children,
+                          sectionIdx * 100
+                      ) // Offset index by 100 per section
+                    : null
+
+                return (
+                    <div
+                        key={`${file?.name}-${section.header || "untitled"}-${sectionIdx}`}
+                        className="section"
+                    >
+                        {RESUME_HEADERS_LIST.includes(
+                            (section.header || "untitled").toUpperCase()
+                        ) && (
+                            <h1
+                                id={`item-${file?.name}-${(section.header || "untitled").toLowerCase()}-0`}
+                                data-filename={file?.name}
+                                data-section={(
+                                    section.header || "untitled"
+                                ).toLowerCase()}
+                                data-index="0"
+                                contentEditable={
+                                    editingMode === "user" &&
+                                    !isViewOnlyMode(editingMode)
+                                }
+                                suppressContentEditableWarning={true}
+                                onInput={handleInput}
+                                className={`${
+                                    editedElements.has(
+                                        `${file?.name}-${(section.header || "untitled").toLowerCase()}-0`
+                                    )
+                                        ? "temp-moatgreen"
+                                        : ""
+                                }`}
+                            >
+                                {section.header || "Untitled"}
+                            </h1>
+                        )}
+                        {isExperience && sectionItems
+                            ? sectionItems.map((job, jobIdx) => (
+                                  <div
+                                      key={`${file?.name}-${job.title}-${jobIdx}`}
+                                  >
+                                      <div
+                                          id={`item-${file?.name}-${(section.header || "untitled").toLowerCase()}-job-${jobIdx}`}
+                                          data-filename={file?.name}
+                                          data-section={(
+                                              section.header || "untitled"
+                                          ).toLowerCase()}
+                                          data-index={jobIdx}
+                                          contentEditable={
+                                              editingMode === "user" &&
+                                              !isViewOnlyMode(editingMode)
+                                          }
+                                          suppressContentEditableWarning={true}
+                                          onInput={handleInput}
+                                          className={`job-title ${
+                                              editedElements.has(
+                                                  `${file?.name}-${(section.header || "untitled").toLowerCase()}-${jobIdx}`
+                                              )
+                                                  ? "temp-moatgreen"
+                                                  : ""
+                                          }`}
+                                      >
+                                          {job.title}
+                                      </div>
+                                      <ul className="job-bullets">
+                                          {job.bullets.map(
+                                              (bullet, bulletIdx) => (
+                                                  <li
+                                                      key={`${file?.name}-${(section.header || "untitled").toLowerCase()}-bullet-${bulletIdx}`}
+                                                      id={`item-${file?.name}-${(section.header || "untitled").toLowerCase()}-bullet-${bulletIdx}`}
+                                                      data-filename={file?.name}
+                                                      data-section={(
+                                                          section.header ||
+                                                          "untitled"
+                                                      ).toLowerCase()}
+                                                      data-index={
+                                                          bulletIdx +
+                                                          jobIdx * 10
+                                                      } // Offset per job
+                                                      contentEditable={
+                                                          editingMode ===
+                                                              "user" &&
+                                                          !isViewOnlyMode(
+                                                              editingMode
+                                                          )
+                                                      }
+                                                      suppressContentEditableWarning={
+                                                          true
+                                                      }
+                                                      onInput={handleInput}
+                                                      className={`bullet-item ${
+                                                          editedElements.has(
+                                                              `${file?.name}-${(section.header || "untitled").toLowerCase()}-bullet-${bulletIdx}`
+                                                          )
+                                                              ? "temp-moatgreen"
+                                                              : ""
+                                                      }`}
+                                                  >
+                                                      {bullet.text}
+                                                  </li>
+                                              )
+                                          )}
+                                      </ul>
+                                  </div>
+                              ))
+                            : section.children.map((item, itemIdx) => {
+                                  const isBulletItem = isBullet(item.text)
+                                  const elementKey = `${file?.name}-${(section.header || "untitled").toLowerCase()}-${itemIdx}`
+                                  return (
+                                      <div
+                                          key={`${file?.name}-${(section.header || "untitled").toLowerCase()}-${itemIdx}`}
+                                          id={`item-${file?.name}-${(section.header || "untitled").toLowerCase()}-${itemIdx}`}
+                                          data-filename={file?.name}
+                                          data-section={(
+                                              section.header || "untitled"
+                                          ).toLowerCase()}
+                                          data-index={itemIdx}
+                                          contentEditable={
+                                              editingMode === "user" &&
+                                              !isViewOnlyMode(editingMode)
+                                          }
+                                          suppressContentEditableWarning={true}
+                                          onInput={handleInput}
+                                          className={`${
+                                              isBulletItem
+                                                  ? "bullet-div"
+                                                  : "paragraph"
+                                          } ${
+                                              editedElements.has(elementKey)
+                                                  ? "temp-moatgreen"
+                                                  : ""
+                                          }`}
+                                      >
+                                          {item.text}
+                                      </div>
+                                  )
+                              })}
+                    </div>
+                )
+            })}
+        </motion.div>
+    )
+}
+
+export default React.memo(ResumeEdit)

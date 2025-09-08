@@ -1,0 +1,407 @@
+import EventBus from "./EventBus.ts"
+
+export class ViRANaturalResponder {
+    /**
+     * Enhanced parseCommand that handles complex natural language editing requests
+     */
+    static async parseCommand(
+        command: string,
+        context: string,
+        editingMode: "user" | "bot",
+        callbacks: {
+            setIsPanelExtended?: (extended: boolean) => void
+            setIsChatPopupOpen?: (open: boolean) => void
+            setMessages: React.Dispatch<
+                React.SetStateAction<
+                    { id?: string; user?: string; bot?: any }[]
+                >
+            >
+        }
+    ): Promise<
+        | {
+              edit_instruction: {
+                  text_to_edit: string
+                  new_text: string
+                  action: string
+                  context_hint: string
+              }
+          }
+        | { message: string }
+        | { error: boolean; message: string }
+        | null
+    > {
+        try {
+            console.log(
+                `[ViRANaturalResponder] Processing command: "${command}"`
+            )
+
+            // Enhanced prompt that handles natural language complex editing
+            const messages = [
+                {
+                    role: "system",
+                    content: `You are ViRA, a resume editing assistant with full NLP capabilities. Parse this command: "${command}" in context: "${context}".
+
+CAPABILITIES:
+1. Process simple editing commands (replace text, add bullet, etc.)
+2. Handle complex requests like "rewrite my experience section to highlight leadership"
+3. Understand thematic edits (leadership, technical, achievements, etc.)
+4. Respond conversationally to all user requests
+
+For ALL editing commands (including complex ones like "rewrite", "enhance", "improve", "focus on", "highlight", etc.), return a JSON object with a single top-level key 'edit_instruction' containing:
+{
+  "text_to_edit": "exact text to modify (can be a whole section for rewrites)",
+  "new_text": "replacement or new text with professional language",
+  "action": "replace|add|delete|append|prepend|move_element|highlight_element",
+  "context_hint": "description of edit location (e.g., 'experience section', 'first job')"
+}
+
+For complex requests, generate appropriate professional content that matches the theme and intent.
+
+For non-editing commands, return { "message": "conversational response text" }.
+
+When generating new content:
+- Maintain bullet point structure where appropriate
+- Use strong action verbs and professional language
+- Preserve facts and details from the original
+- Emphasize requested qualities (leadership, technical skills, etc.)
+- Quantify achievements where possible`,
+                },
+                { role: "user", content: command },
+            ]
+
+            // Check if this is a simple greeting or non-edit command
+            const isSimpleGreeting =
+                /^(hi|hello|hey|greetings|howdy|hi there|hello there).*/i.test(
+                    command.trim().toLowerCase()
+                )
+            if (isSimpleGreeting) {
+                return {
+                    message: `Hello! I'm ViRA, your resume assistant. How can I help with your resume today?`,
+                }
+            }
+
+            console.log(`[ViRANaturalResponder] Sending API request`)
+            const response = await fetch(
+                "https://nextjs-boilerplate-vira.vercel.app/api/chat",
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ model: "gpt-4o", messages }),
+                }
+            )
+
+            if (!response.ok) {
+                const errorText = await response.text()
+                console.error(
+                    `[ViRANaturalResponder] API error (${response.status}):`,
+                    errorText
+                )
+                throw new Error(
+                    `API request failed: ${response.status} - ${errorText}`
+                )
+            }
+
+            const data = await response.json()
+            const responseText = data?.choices?.[0]?.message?.content || ""
+            console.log(
+                `[ViRANaturalResponder] Raw API response:`,
+                responseText
+            )
+
+            try {
+                const parsedResponse = JSON.parse(responseText)
+                console.log(
+                    `[ViRANaturalResponder] Parsed response:`,
+                    parsedResponse
+                )
+
+                if (parsedResponse.edit_instruction) {
+                    const { edit_instruction } = parsedResponse
+
+                    // Validate edit instruction format
+                    if (
+                        ![
+                            "replace",
+                            "add",
+                            "delete",
+                            "append",
+                            "prepend",
+                            "move_element",
+                            "highlight_element",
+                        ].includes(edit_instruction.action) ||
+                        typeof edit_instruction.text_to_edit !== "string" ||
+                        typeof edit_instruction.new_text !== "string" ||
+                        typeof edit_instruction.context_hint !== "string"
+                    ) {
+                        console.error(
+                            "[ViRANaturalResponder] Invalid edit_instruction format:",
+                            edit_instruction
+                        )
+                        throw new Error("Invalid edit_instruction format")
+                    }
+
+                    const filename =
+                        context.split("\n")[0].replace("File: ", "") ||
+                        "resume.docx"
+
+                    // Enhanced section detection for complex edits
+                    const section = this.extractSectionFromHint(
+                        edit_instruction.context_hint,
+                        context
+                    )
+
+                    const index = 0 // Default index, dynamically resolved in ResumeDisplay
+                    const targetId = `item-${filename}-${section}-${index}`
+
+                    console.log(
+                        `[ViRANaturalResponder] Emitting edit event to ${targetId}`
+                    )
+                    EventBus.emit("ViRACommand", {
+                        target: targetId,
+                        content: edit_instruction.new_text,
+                        method: edit_instruction.action,
+                    })
+
+                    if (editingMode !== "bot") {
+                        console.log(
+                            `[ViRANaturalResponder] Emitting patch event for ${section}`
+                        )
+                        EventBus.emit("PatchEvent", {
+                            filename,
+                            section,
+                            index,
+                            newText: edit_instruction.new_text,
+                            operation: edit_instruction.action,
+                        })
+                    }
+
+                    // We return the parsed response without setting messages
+                    // This allows the parent component to handle message display
+                    return parsedResponse
+                } else if (parsedResponse.message) {
+                    console.log(
+                        `[ViRANaturalResponder] Returning message response`
+                    )
+                    // Return message without setting messages in this component
+                    return parsedResponse
+                } else {
+                    console.error(
+                        "[ViRANaturalResponder] Invalid response format:",
+                        parsedResponse
+                    )
+                    throw new Error("Invalid response format")
+                }
+            } catch (parseError) {
+                // If JSON parsing fails, try to use the raw text as a message
+                console.error(
+                    "[ViRANaturalResponder] Error parsing JSON:",
+                    parseError
+                )
+
+                if (
+                    responseText.includes("edit_instruction") ||
+                    responseText.includes("context_hint")
+                ) {
+                    // It looks like it was trying to return an edit instruction but failed
+                    console.log(
+                        "[ViRANaturalResponder] Response contains edit_instruction keywords but parsing failed"
+                    )
+                    return {
+                        error: true,
+                        message:
+                            "I'm having trouble processing your edit request. Could you try simplifying or rephrasing it?",
+                    }
+                } else {
+                    // If it doesn't look like an edit instruction, treat as a conversation
+                    return { message: responseText }
+                }
+            }
+        } catch (error) {
+            console.error("[ViRANaturalResponder] Main error handler:", error)
+            EventBus.emit("PatchEvent", {
+                filename: "resume.docx",
+                section: "error",
+                index: 0,
+                newText: "",
+                operation: "highlight",
+            })
+
+            return {
+                error: true,
+                message:
+                    "I encountered an issue processing your request. Please try rephrasing or use more specific instructions.",
+            }
+        }
+    }
+
+    /**
+     * Extract the section name from context hint
+     */
+    private static extractSectionFromHint(
+        contextHint: string,
+        documentContext: string
+    ): string {
+        console.log(
+            `[ViRANaturalResponder] Extracting section from hint: ${contextHint}`
+        )
+
+        // Try to extract section from the hint
+        const sectionPatterns = [
+            /(\w+)\s+section/i,
+            /section\s+(\w+)/i,
+            /^(\w+)$/i,
+        ]
+
+        for (const pattern of sectionPatterns) {
+            const match = contextHint.match(pattern)
+            if (match && match[1]) {
+                console.log(
+                    `[ViRANaturalResponder] Section extracted from pattern: ${match[1].toLowerCase()}`
+                )
+                return match[1].toLowerCase()
+            }
+        }
+
+        // Fall back to checking common section names
+        const commonSections = [
+            "experience",
+            "education",
+            "skills",
+            "summary",
+            "projects",
+            "objective",
+            "profile",
+            "interests",
+        ]
+
+        for (const section of commonSections) {
+            if (contextHint.toLowerCase().includes(section)) {
+                console.log(
+                    `[ViRANaturalResponder] Section matched from common sections: ${section}`
+                )
+                return section
+            }
+        }
+
+        // Check if any section headers in the document match
+        const sectionHeaders = documentContext.match(/===\s+(.*?)\s+===/g) || []
+        for (const header of sectionHeaders) {
+            const sectionName = header
+                .replace(/===\s+/, "")
+                .replace(/\s+===/, "")
+                .toLowerCase()
+            if (contextHint.toLowerCase().includes(sectionName)) {
+                console.log(
+                    `[ViRANaturalResponder] Section matched from document headers: ${sectionName}`
+                )
+                return sectionName
+            }
+        }
+
+        // Default fallback
+        const fallbackSection = contextHint.split(/\s+/)[0].toLowerCase()
+        console.log(
+            `[ViRANaturalResponder] Using fallback section name: ${fallbackSection}`
+        )
+        return fallbackSection
+    }
+
+    /**
+     * Create a natural conversational response from edit instruction
+     * Note: This is kept for reference but no longer used directly in parseCommand
+     */
+    static createNaturalResponse(
+        command: string,
+        editInstruction: any
+    ): string {
+        const { text_to_edit, new_text, action, context_hint } = editInstruction
+
+        // Identify the intent from the command
+        const intent = this.identifyIntent(command)
+
+        // Create appropriate natural language response based on intent
+        switch (intent) {
+            case "rewrite":
+                return `I've rewritten the ${context_hint} to better highlight the key points. Let me know if you'd like any further adjustments!`
+
+            case "enhance":
+                return `I've enhanced the ${context_hint} with more impactful language. Take a look and let me know what you think.`
+
+            case "leadership":
+                return `I've updated the ${context_hint} to emphasize your leadership experience and skills. The content now better showcases your management abilities.`
+
+            case "technical":
+                return `I've revised the ${context_hint} to highlight your technical expertise. The content now better demonstrates your technical skills and accomplishments.`
+
+            case "achievements":
+                return `I've updated the ${context_hint} to showcase your achievements more effectively. The content now better emphasizes your results and impact.`
+
+            case "simple_edit":
+                return `I've made the requested change to the ${context_hint}.`
+
+            default:
+                return `I've updated the ${context_hint} based on your request. Take a look and let me know if you'd like any adjustments.`
+        }
+    }
+
+    /**
+     * Identify the intent from the user's command
+     */
+    private static identifyIntent(command: string): string {
+        const commandLower = command.toLowerCase()
+
+        if (/rewrite|revise|redo/.test(commandLower)) {
+            return "rewrite"
+        }
+
+        if (/enhance|improve|better|upgrade/.test(commandLower)) {
+            return "enhance"
+        }
+
+        if (
+            /leadership|management|executive|lead|director/.test(commandLower)
+        ) {
+            return "leadership"
+        }
+
+        if (
+            /technical|skills|technology|programming|engineering/.test(
+                commandLower
+            )
+        ) {
+            return "technical"
+        }
+
+        if (
+            /achievements|accomplishments|results|impact|outcomes/.test(
+                commandLower
+            )
+        ) {
+            return "achievements"
+        }
+
+        return "simple_edit"
+    }
+
+    static setCursor(filename: string, section: string, index: number) {
+        console.log(
+            `[ViRANaturalResponder] Setting cursor to ${filename}:${section}:${index}`
+        )
+        EventBus.emit("ViRACommand", {
+            target: `#${filename}-${section.toLowerCase()}-${index}`,
+            content: "",
+            method: "highlight_element",
+        })
+    }
+
+    static showEditingAt(filename: string, section: string, index: number) {
+        console.log(
+            `[ViRANaturalResponder] Showing editing at ${filename}:${section}:${index}`
+        )
+        EventBus.emit("ViRACommand", {
+            target: `#${filename}-${section.toLowerCase()}-${index}`,
+            content: "",
+            method: "highlight_element",
+        })
+    }
+}

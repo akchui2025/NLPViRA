@@ -1,0 +1,790 @@
+import EventBus from "./EventBus.ts"
+import ViraCursorEngine from "./ViraCursorEngine.ts"
+import { ViRAFramerBridge } from "./ViRAFramerBridge.tsx"
+import { ViRAFramerBridgeIntegration } from "./ViRAFramerBridgeIntegration.ts"
+import { NormalizedItem } from "./NormalizedItem.ts"
+
+export class ViRADocumentEditor {
+    private static instance: ViRADocumentEditor
+    private documentModel: DocumentModel
+    private cursorEngine: ViraCursorEngine
+    private documentBridge: any
+    private isActive: boolean = false
+    private currentFile: string | null = null
+    private elements: Map<string, HTMLElement> = new Map()
+    private elementOrder: string[] = []
+    private selection: {
+        start: { elementId: string; offset: number } | null
+        end: { elementId: string; offset: number } | null
+    } = { start: null, end: null }
+
+    private constructor(documentBridge?: any) {
+        this.documentBridge = documentBridge
+        this.cursorEngine = ViraCursorEngine.getInstance()
+        this.documentModel = new DocumentModel()
+        this.setupEventListeners()
+    }
+
+    public static getInstance(documentBridge?: any): ViRADocumentEditor {
+        if (!ViRADocumentEditor.instance) {
+            ViRADocumentEditor.instance = new ViRADocumentEditor(documentBridge)
+        }
+        return ViRADocumentEditor.instance
+    }
+
+    private isViewOnlyMode(): boolean {
+        return document.body.classList.contains("view-only")
+    }
+
+    private async parseNLPCommand(command: any): Promise<any> {
+        const nlpPatterns = [
+            {
+                intent: "replace",
+                patterns: [
+                    /replace\s+(.*?)\s+with\s+(.*)/i,
+                    /change\s+(.*?)\s+to\s+(.*)/i,
+                    /update\s+(.*?)\s+to\s+(.*)/i,
+                ],
+                extract: (match: RegExpMatchArray) => ({
+                    method: "replace",
+                    target: match[1].trim(),
+                    content: match[2].trim(),
+                }),
+            },
+            {
+                intent: "replaceChar",
+                patterns: [
+                    /replace\s+character\s+at\s+(.*?)\s+position\s+(\d+)\s+with\s+(.)/i,
+                ],
+                extract: (match: RegExpMatchArray) => ({
+                    method: "replaceChar",
+                    target: match[1].trim(),
+                    offset: parseInt(match[2], 10),
+                    content: match[3],
+                }),
+            },
+            {
+                intent: "rewriteResume",
+                patterns: [
+                    /rewrite\s+(?:entire\s+)?resume\s+with\s+(.*)/i,
+                    /update\s+(?:entire\s+)?resume\s+to\s+(.*)/i,
+                ],
+                extract: (match: RegExpMatchArray) => ({
+                    method: "rewriteResume",
+                    content: match[1].trim(),
+                }),
+            },
+            {
+                intent: "insert",
+                patterns: [
+                    /insert\s+(.*?)\s+(at|in)\s+(.*)/i,
+                    /add\s+(.*?)\s+(at|in)\s+(.*)/i,
+                ],
+                extract: (match: RegExpMatchArray) => ({
+                    method: "insert",
+                    target: match[3].trim(),
+                    content: match[1].trim(),
+                }),
+            },
+            {
+                intent: "delete",
+                patterns: [/delete\s+(.*)/i, /remove\s+(.*)/i],
+                extract: (match: RegExpMatchArray) => ({
+                    method: "delete",
+                    target: match[1].trim(),
+                    count: 1,
+                    direction: "forward",
+                }),
+            },
+            {
+                intent: "navigateToSection",
+                patterns: [/go\s+to\s+(.*)/i, /navigate\s+to\s+(.*)/i],
+                extract: (match: RegExpMatchArray) => ({
+                    method: "navigateToSection",
+                    section: match[1].trim(),
+                }),
+            },
+        ]
+
+        const commandText = command.text?.trim() || ""
+        for (const pattern of nlpPatterns) {
+            for (const regex of pattern.patterns) {
+                const match = commandText.match(regex)
+                if (match) {
+                    return pattern.extract(match)
+                }
+            }
+        }
+
+        console.warn(
+            `[ViRADocumentEditor] Unrecognized NLP command: ${commandText}`
+        )
+        return null
+    }
+
+    private setupEventListeners(): void {
+        document.addEventListener("keydown", this.handleKeyDown.bind(this))
+        EventBus.on("ViRACommand", this.handleViRACommand.bind(this))
+        EventBus.on("CursorMoveEvent", this.handleCursorMoveEvent.bind(this))
+    }
+
+    private async handleViRACommand(command: any): Promise<void> {
+        if (!this.isActive) return
+
+        console.log("[ViRADocumentEditor] Processing command:", command)
+
+        const parsedCommand = command.text
+            ? await this.parseNLPCommand(command)
+            : command
+
+        if (!parsedCommand) {
+            console.warn("[ViRADocumentEditor] Invalid or unparsed command")
+            return
+        }
+
+        if (parsedCommand.method === "highlight_element") {
+            return // Silently ignore highlight_element
+        }
+
+        switch (parsedCommand.method) {
+            case "replace":
+                await this.replaceText(
+                    parsedCommand.target,
+                    parsedCommand.content
+                )
+                break
+            case "replaceChar":
+                await this.replaceChar(
+                    parsedCommand.target,
+                    parsedCommand.offset,
+                    parsedCommand.content
+                )
+                break
+            case "rewriteResume":
+                await this.rewriteResume(parsedCommand.content)
+                break
+            case "replaceAll":
+                await this.replaceAllOccurrences(
+                    parsedCommand.findText,
+                    parsedCommand.replaceText
+                )
+                break
+            case "insert":
+                this.insertTextAtCursor(parsedCommand.content)
+                break
+            case "delete":
+                this.deleteTextAtCursor(
+                    parsedCommand.count,
+                    parsedCommand.direction
+                )
+                break
+            case "navigate":
+                this.navigateToParagraph(parsedCommand.target)
+                break
+            case "navigateToSection":
+                this.navigateToSection(parsedCommand.section)
+                break
+            case "moveTo":
+                this.moveCursorToElement(
+                    parsedCommand.target,
+                    parsedCommand.offset || 0
+                )
+                break
+            case "multiReplace":
+                await this.performMultiElementEdit(parsedCommand.edits)
+                break
+            default:
+                console.warn(
+                    `[ViRADocumentEditor] Unhandled command method: ${parsedCommand.method}`
+                )
+        }
+    }
+
+    public async replaceChar(
+        targetId: string,
+        offset: number,
+        newChar: string
+    ): Promise<boolean> {
+        if (this.isViewOnlyMode()) {
+            console.warn(
+                `[ViRADocumentEditor] Cannot replace character in view-only mode`
+            )
+            return false
+        }
+
+        const elementId = targetId.startsWith("#")
+            ? targetId.substring(1)
+            : this.resolveTargetId(targetId)
+        const element = this.elements.get(elementId)
+
+        if (!element) {
+            console.warn(`[ViRADocumentEditor] Element not found: ${elementId}`)
+            return false
+        }
+
+        const currentText = element.textContent || ""
+        if (offset < 0 || offset >= currentText.length) {
+            console.warn(`[ViRADocumentEditor] Invalid offset: ${offset}`)
+            return false
+        }
+
+        const newText =
+            currentText.slice(0, offset) +
+            newChar +
+            currentText.slice(offset + 1)
+
+        element.textContent = newText
+        this.setCursorPosition(elementId, offset + 1)
+        this.documentModel.updateElementContent(elementId, newText)
+
+        const bridge = ViRAFramerBridge.getInstance()
+        const success = bridge.editElement({
+            target: elementId,
+            content: newText,
+            method: "replace",
+        })
+
+        if (success) {
+            const integration = new ViRAFramerBridgeIntegration()
+            integration.processViRAEdit({
+                target: elementId,
+                content: newText,
+                method: "replace",
+            })
+        }
+
+        this.updateDocumentState(element, newText)
+        return true
+    }
+
+    public async rewriteResume(newContent: string): Promise<boolean> {
+        if (this.isViewOnlyMode()) {
+            console.warn(
+                `[ViRADocumentEditor] Cannot rewrite resume in view-only mode`
+            )
+            return false
+        }
+
+        if (!this.currentFile) {
+            console.warn("[ViRADocumentEditor] No active file for rewrite")
+            return false
+        }
+        const newItems: NormalizedItem[] = newContent
+            .split("\n\n")
+            .map((text, index) => ({
+                elementId: `${this.currentFile}-section-${index}`,
+                text,
+                type: index === 0 ? "header" : "paragraph",
+            }))
+        this.elements.clear()
+        this.elementOrder = []
+        newItems.forEach((item, index) => {
+            const elementId = item.elementId
+            const element = document.createElement("div")
+            element.setAttribute("data-filename", this.currentFile || "")
+            element.setAttribute("data-section", `section-${index}`)
+            element.setAttribute("data-index", index.toString())
+            element.textContent = item.text
+            document.body.appendChild(element)
+            this.elements.set(elementId, element)
+            this.elementOrder.push(elementId)
+        })
+        this.documentModel.initialize(this.elements, this.elementOrder)
+        const bridge = ViRAFramerBridge.getInstance()
+        const success = newItems.every((item) =>
+            bridge.editElement({
+                target: item.elementId,
+                content: item.text,
+                method: "replace",
+            })
+        )
+        if (success) {
+            const integration = new ViRAFramerBridgeIntegration()
+            newItems.forEach((item) =>
+                integration.processViRAEdit({
+                    target: item.elementId,
+                    content: item.text,
+                    method: "replace",
+                })
+            )
+        }
+        await this.documentBridge.updateDocument(this.currentFile, newItems)
+        this.setCursorPosition(this.elementOrder[0], 0)
+        return success
+    }
+
+    public initialize(filename: string): boolean {
+        this.currentFile = filename
+        this.isActive = true
+        this.indexDocumentElements(filename)
+        this.cursorEngine.init()
+        this.selection = { start: null, end: null }
+        console.log(
+            `[ViRADocumentEditor] Initialized with ${this.elements.size} elements for file ${filename}`
+        )
+        if (this.elementOrder.length > 0) {
+            this.setCursorPosition(this.elementOrder[0], 0)
+            return true
+        }
+        return false
+    }
+
+    private indexDocumentElements(filename: string): void {
+        this.elements.clear()
+        this.elementOrder = []
+        const elements = document.querySelectorAll(
+            `[data-filename="${filename}"]`
+        )
+        if (elements.length === 0) {
+            console.warn(
+                `[ViRADocumentEditor] No elements found for file ${filename}`
+            )
+            return
+        }
+        const elementsArray = Array.from(elements) as HTMLElement[]
+        elementsArray.sort((a, b) => {
+            const aSection = a.getAttribute("data-section") || ""
+            const bSection = b.getAttribute("data-section") || ""
+            const aIndex = parseInt(a.getAttribute("data-index") || "0")
+            const bIndex = parseInt(b.getAttribute("data-index") || "0")
+            if (aSection === bSection) return aIndex - bIndex
+            return aSection.localeCompare(bSection)
+        })
+        elementsArray.forEach((element) => {
+            const section = element.getAttribute("data-section") || ""
+            const index = element.getAttribute("data-index") || ""
+            const elementId = `${filename}-${section}-${index}`
+            this.elements.set(elementId, element)
+            this.elementOrder.push(elementId)
+        })
+    }
+
+    private handleKeyDown(event: KeyboardEvent): void {
+        if (this.isViewOnlyMode()) return
+        if (!this.isActive) return
+
+        const isMac = navigator.platform.includes("Mac")
+        const modKey = isMac ? event.metaKey : event.ctrlKey
+
+        switch (event.key) {
+            case "ArrowUp":
+                event.preventDefault()
+                this.moveCursorUp()
+                break
+            case "ArrowDown":
+                event.preventDefault()
+                this.moveCursorDown()
+                break
+            case "ArrowLeft":
+                event.preventDefault()
+                this.moveCursorLeft()
+                break
+            case "ArrowRight":
+                event.preventDefault()
+                this.moveCursorRight()
+                break
+            case "Home":
+                event.preventDefault()
+                this.moveCursorToStartOfLine()
+                break
+            case "End":
+                event.preventDefault()
+                this.moveCursorToEndOfLine()
+                break
+            default:
+                if (modKey && event.key.toLowerCase() === "z") {
+                    event.preventDefault()
+                    console.log("[ViRADocumentEditor] Undo triggered")
+                    EventBus.emit("UndoEvent", {})
+                }
+                break
+        }
+    }
+
+    private handleCursorMoveEvent(payload: {
+        elementId: string
+        offset: number
+    }): void {
+        if (!this.isActive) return
+        this.setCursorPosition(payload.elementId, payload.offset)
+    }
+
+    private getElementId(element: HTMLElement): string {
+        const filename =
+            element.getAttribute("data-filename") || this.currentFile || ""
+        const section = element.getAttribute("data-section") || ""
+        const index = element.getAttribute("data-index") || "0"
+        return `${filename}-${section}-${index}`
+    }
+
+    private navigateToSection(section: string): boolean {
+        const targetElementId = Array.from(this.elements.keys()).find((id) =>
+            id.includes(section.toLowerCase())
+        )
+        if (!targetElementId) {
+            console.warn(`[ViRADocumentEditor] Section not found: ${section}`)
+            return false
+        }
+        return this.setCursorPosition(targetElementId, 0)
+    }
+
+    private setCursorPosition(elementId: string, offset: number): boolean {
+        try {
+            const element = this.elements.get(elementId)
+            if (!element) {
+                console.warn(
+                    `[ViRADocumentEditor] Element not found: ${elementId}`
+                )
+                return false
+            }
+
+            this.selection.start = { elementId, offset }
+            this.selection.end = { elementId, offset }
+
+            const range = document.createRange()
+            const selection = window.getSelection()
+            if (!selection) return false
+
+            const textNode = Array.from(element.childNodes).find(
+                (node) => node.nodeType === Node.TEXT_NODE
+            ) as Text | undefined
+
+            if (!textNode) {
+                console.warn(
+                    `[ViRADocumentEditor] No text node found in element: ${elementId}`
+                )
+                return false
+            }
+
+            if (offset > textNode.length) {
+                console.warn(
+                    `[ViRADocumentEditor] Offset ${offset} exceeds text length ${textNode.length} in ${elementId}`
+                )
+                return false
+            }
+
+            range.setStart(textNode, offset)
+            range.setEnd(textNode, offset)
+            range.collapse(true)
+            selection.removeAllRanges()
+            selection.addRange(range)
+            element.scrollIntoView({ behavior: "smooth", block: "nearest" })
+        } catch (error) {
+            console.error(
+                "[ViRADocumentEditor] Error setting cursor position:",
+                error
+            )
+        }
+        return true
+    }
+
+    public async replaceText(
+        targetId: string,
+        newContent: string
+    ): Promise<boolean> {
+        if (this.isViewOnlyMode()) {
+            console.warn(
+                `[ViRADocumentEditor] Cannot replace text in view-only mode`
+            )
+            return false
+        }
+
+        const elementId = targetId.startsWith("#")
+            ? targetId.substring(1)
+            : this.resolveTargetId(targetId)
+        const element = this.elements.get(elementId)
+
+        if (!element) {
+            console.warn(`[ViRADocumentEditor] Element not found: ${elementId}`)
+            return false
+        }
+
+        element.textContent = newContent
+        this.setCursorPosition(elementId, newContent.length)
+        this.documentModel.updateElementContent(elementId, newContent)
+
+        const bridge = ViRAFramerBridge.getInstance()
+        const success = bridge.editElement({
+            target: elementId,
+            content: newContent,
+            method: "replace",
+        })
+
+        if (success) {
+            this.updateDocumentState(element, newContent)
+        }
+        return success
+    }
+
+    public async replaceAllOccurrences(
+        findText: string,
+        replaceText: string
+    ): Promise<number> {
+        let count = 0
+        for (const elementId of this.elementOrder) {
+            const element = this.elements.get(elementId)
+            if (!element) continue
+            const text = element.textContent || ""
+            if (text.includes(findText)) {
+                const newText = text.replace(
+                    new RegExp(this.escapeRegExp(findText), "g"),
+                    replaceText
+                )
+                element.textContent = newText
+                this.setCursorPosition(elementId, newText.length)
+                this.documentModel.updateElementContent(elementId, newText)
+                this.updateDocumentState(element, newText)
+                count++
+            }
+        }
+        console.log(
+            `[ViRADocumentEditor] Replaced ${count} occurrences of "${findText}" with "${replaceText}"`
+        )
+        return count
+    }
+
+    public insertTextAtCursor(text: string): boolean {
+        if (!this.selection.start) return false
+        const { elementId, offset } = this.selection.start
+        const element = this.elements.get(elementId)
+        if (!element) return false
+        const currentText = element.textContent || ""
+        const newText =
+            currentText.slice(0, offset) + text + currentText.slice(offset)
+        element.textContent = newText
+        this.setCursorPosition(elementId, offset + text.length)
+        this.documentModel.updateElementContent(elementId, newText)
+        this.updateDocumentState(element, newText)
+        return true
+    }
+
+    public deleteTextAtCursor(
+        count: number = 1,
+        direction: "forward" | "backward" = "forward"
+    ): boolean {
+        if (!this.selection.start) return false
+        const { elementId, offset } = this.selection.start
+        const element = this.elements.get(elementId)
+        if (!element) return false
+        const currentText = element.textContent || ""
+        let newText: string
+        let newOffset: number
+        if (direction === "forward") {
+            newText =
+                currentText.slice(0, offset) + currentText.slice(offset + count)
+            newOffset = offset
+        } else {
+            const deleteStart = Math.max(0, offset - count)
+            newText =
+                currentText.slice(0, deleteStart) + currentText.slice(offset)
+            newOffset = deleteStart
+        }
+        element.textContent = newText
+        this.setCursorPosition(elementId, newOffset)
+        this.documentModel.updateElementContent(elementId, newText)
+        this.updateDocumentState(element, newText)
+        return true
+    }
+
+    private navigateToParagraph(target: string): boolean {
+        const elementId = this.resolveTargetId(target)
+        if (!elementId) return false
+        return this.setCursorPosition(elementId, 0)
+    }
+
+    private moveCursorToElement(target: string, offset: number): boolean {
+        const elementId = this.resolveTargetId(target)
+        if (!elementId) return false
+        return this.setCursorPosition(elementId, offset)
+    }
+
+    public async performMultiElementEdit(
+        edits: Array<{ target: string; content: string }>
+    ): Promise<boolean> {
+        if (this.isViewOnlyMode()) {
+            console.warn(
+                `[ViRADocumentEditor] Cannot perform multi-element edit in view-only mode`
+            )
+            return false
+        }
+        if (!edits || edits.length === 0) return false
+        let success = true
+        for (const edit of edits) {
+            const elementId = this.resolveTargetId(edit.target)
+            if (!elementId) {
+                success = false
+                continue
+            }
+            const element = this.elements.get(elementId)
+            if (!element) {
+                success = false
+                continue
+            }
+            element.textContent = edit.content
+            this.setCursorPosition(elementId, edit.content.length)
+            this.documentModel.updateElementContent(elementId, edit.content)
+            this.updateDocumentState(element, edit.content)
+        }
+        return success
+    }
+
+    private moveCursorUp(): boolean {
+        if (!this.selection.start) return false
+        const { elementId, offset } = this.selection.start
+        const currentIndex = this.elementOrder.indexOf(elementId)
+        if (currentIndex <= 0) return false
+        const prevElementId = this.elementOrder[currentIndex - 1]
+        const prevElement = this.elements.get(prevElementId)
+        if (!prevElement) return false
+        const prevText = prevElement.textContent || ""
+        const newOffset = Math.min(offset, prevText.length)
+        return this.setCursorPosition(prevElementId, newOffset)
+    }
+
+    private moveCursorDown(): boolean {
+        if (!this.selection.start) return false
+        const { elementId, offset } = this.selection.start
+        const currentIndex = this.elementOrder.indexOf(elementId)
+        if (currentIndex >= this.elementOrder.length - 1) return false
+        const nextElementId = this.elementOrder[currentIndex + 1]
+        const nextElement = this.elements.get(nextElementId)
+        if (!nextElement) return false
+        const nextText = nextElement.textContent || ""
+        const newOffset = Math.min(offset, nextText.length)
+        return this.setCursorPosition(nextElementId, newOffset)
+    }
+
+    private moveCursorLeft(): boolean {
+        if (!this.selection.start) return false
+        const { elementId, offset } = this.selection.start
+        if (offset > 0) {
+            return this.setCursorPosition(elementId, offset - 1)
+        } else {
+            const currentIndex = this.elementOrder.indexOf(elementId)
+            if (currentIndex <= 0) return false
+            const prevElementId = this.elementOrder[currentIndex - 1]
+            const prevElement = this.elements.get(prevElementId)
+            if (!prevElement) return false
+            const prevText = prevElement.textContent || ""
+            return this.setCursorPosition(prevElementId, prevText.length)
+        }
+    }
+
+    private moveCursorRight(): boolean {
+        if (!this.selection.start) return false
+        const { elementId, offset } = this.selection.start
+        const element = this.elements.get(elementId)
+        if (!element) return false
+        const text = element.textContent || ""
+        if (offset < text.length) {
+            return this.setCursorPosition(elementId, offset + 1)
+        } else {
+            const currentIndex = this.elementOrder.indexOf(elementId)
+            if (currentIndex >= this.elementOrder.length - 1) return false
+            const nextElementId = this.elementOrder[currentIndex + 1]
+            return this.setCursorPosition(nextElementId, 0)
+        }
+    }
+
+    private moveCursorToStartOfLine(): boolean {
+        if (!this.selection.start) return false
+        return this.setCursorPosition(this.selection.start.elementId, 0)
+    }
+
+    private moveCursorToEndOfLine(): boolean {
+        if (!this.selection.start) return false
+        const { elementId } = this.selection.start
+        const element = this.elements.get(elementId)
+        if (!element) return false
+        const text = element.textContent || ""
+        return this.setCursorPosition(elementId, text.length)
+    }
+
+    private resolveTargetId(target: string): string {
+        if (this.elements.has(target)) return target
+        if (target.startsWith("#") || target.startsWith(".")) {
+            const element = document.querySelector(target) as HTMLElement
+            if (element) {
+                return this.getElementId(element)
+            }
+        }
+        const parts = target.split("-")
+        if (parts.length >= 3) {
+            const filename = this.currentFile || parts[0]
+            const section = parts[1]
+            const index = parts[2]
+            const constructedId = `${filename}-${section}-${index}`
+            if (this.elements.has(constructedId)) return constructedId
+        }
+        for (const [elementId, element] of this.elements.entries()) {
+            const elFilename = element.getAttribute("data-filename") || ""
+            const elSection = element.getAttribute("data-section") || ""
+            const elIndex = element.getAttribute("data-index") || ""
+            if (target.includes(elSection) && target.includes(elIndex)) {
+                return elementId
+            }
+        }
+        console.warn(
+            `[ViRADocumentEditor] Could not resolve target ID: ${target}`
+        )
+        return ""
+    }
+
+    private updateDocumentState(
+        element: HTMLElement,
+        newContent: string
+    ): void {
+        if (this.isViewOnlyMode()) {
+            console.warn(
+                `[ViRADocumentEditor] Cannot update document state in view-only mode`
+            )
+            return
+        }
+
+        const section = element.getAttribute("data-section") || ""
+        const index = parseInt(element.getAttribute("data-index") || "0", 10)
+        const filename =
+            element.getAttribute("data-filename") || this.currentFile || ""
+
+        EventBus.emit("UpdateResumeState", {
+            section,
+            index,
+            newContent,
+            filename,
+        })
+    }
+
+    private escapeRegExp(string: string): string {
+        return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    }
+}
+
+class DocumentModel {
+    private elementContents: Map<string, string> = new Map()
+    private elementOrder: string[] = []
+
+    public initialize(
+        elements: Map<string, HTMLElement>,
+        order: string[]
+    ): void {
+        this.elementOrder = [...order]
+        this.elementContents.clear()
+        for (const [id, element] of elements.entries()) {
+            this.elementContents.set(id, element.textContent || "")
+        }
+    }
+
+    public updateElementContent(elementId: string, content: string): void {
+        this.elementContents.set(elementId, content)
+    }
+
+    public getElementContent(elementId: string): string {
+        return this.elementContents.get(elementId) || ""
+    }
+
+    public getAllContent(): string {
+        return this.elementOrder
+            .map((id) => this.elementContents.get(id) || "")
+            .join("\n")
+    }
+}
