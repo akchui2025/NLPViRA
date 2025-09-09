@@ -343,7 +343,7 @@ const MoatChatGPT: React.FC<MoatChatGPTProps> = ({
         const startIndex = items.findIndex(
             (item) =>
                 item.type === "header" &&
-                item.text.toLowerCase().trim() === sectionNameLower
+                item.text.toLowerCase().trim().includes(sectionNameLower)
         )
 
         if (startIndex === -1) return null
